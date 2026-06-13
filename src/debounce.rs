@@ -1,5 +1,5 @@
-use crate::command::{CommandExecutor, CommandOutcome};
-use crate::state::{CommandRunnerPhase, RuntimeState};
+use crate::lane::{CommandRunReport, CommandTriggerTarget, await_trigger_finished};
+use crate::state::RuntimeState;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
@@ -11,9 +11,8 @@ pub struct DebounceRunner {
     mailbox: String,
     debounce: Duration,
     cooldown: Duration,
-    executor: Arc<dyn CommandExecutor>,
+    trigger: Arc<dyn CommandTriggerTarget>,
     state: Option<Arc<RuntimeState>>,
-    runner_id: String,
 }
 
 impl DebounceRunner {
@@ -22,25 +21,22 @@ impl DebounceRunner {
         mailbox: impl Into<String>,
         debounce: Duration,
         cooldown: Duration,
-        executor: Arc<dyn CommandExecutor>,
+        trigger: Arc<dyn CommandTriggerTarget>,
         state: Option<Arc<RuntimeState>>,
     ) -> Self {
         let account = account.into();
         let mailbox = mailbox.into();
-        let runner_id = format!("{account}/{mailbox}");
         Self {
             account,
             mailbox,
             debounce,
             cooldown,
-            executor,
+            trigger,
             state,
-            runner_id,
         }
     }
 
     pub async fn run(self, mut events: mpsc::Receiver<()>, mut shutdown: watch::Receiver<bool>) {
-        self.mark_runner(CommandRunnerPhase::Idle);
         let mut last_command_finished = None;
         loop {
             let got_event = tokio::select! {
@@ -59,7 +55,6 @@ impl DebounceRunner {
             self.mark_event();
 
             loop {
-                self.mark_runner(CommandRunnerPhase::Debouncing);
                 if !sleep_or_shutdown(self.debounce, &mut shutdown).await {
                     return;
                 }
@@ -70,7 +65,9 @@ impl DebounceRunner {
                 {
                     return;
                 }
-                self.run_once(shutdown.clone()).await;
+                if !self.run_once(&mut shutdown).await {
+                    return;
+                }
                 last_command_finished = Some(Instant::now());
 
                 if self.drain_events(&mut events) {
@@ -84,12 +81,6 @@ impl DebounceRunner {
     fn mark_event(&self) {
         if let Some(state) = &self.state {
             state.mark_event();
-        }
-    }
-
-    fn mark_runner(&self, phase: CommandRunnerPhase) {
-        if let Some(state) = &self.state {
-            state.mark_command_runner(&self.runner_id, phase);
         }
     }
 
@@ -118,7 +109,6 @@ impl DebounceRunner {
         if elapsed >= self.cooldown {
             return true;
         }
-        self.mark_runner(CommandRunnerPhase::CoolingDown);
         if !sleep_or_shutdown(self.cooldown - elapsed, shutdown).await {
             return false;
         }
@@ -126,48 +116,67 @@ impl DebounceRunner {
         true
     }
 
-    async fn run_once(&self, shutdown: watch::Receiver<bool>) {
+    async fn run_once(&self, shutdown: &mut watch::Receiver<bool>) -> bool {
         info!(
             account = %self.account,
             mailbox = %self.mailbox,
-            "starting notification command"
+            "submitting notification command"
         );
-        if let Some(state) = &self.state {
-            state.mark_command_started(&self.runner_id);
-        }
-        match self.executor.run(shutdown).await {
-            Ok(outcome) => self.record_outcome(outcome),
-            Err(error) => {
-                if let Some(state) = &self.state {
-                    state.mark_command_error();
-                    state.mark_command_runner(&self.runner_id, CommandRunnerPhase::Idle);
+        let start = self.trigger.start();
+        tokio::pin!(start);
+        let lifecycle = tokio::select! {
+            result = &mut start => result,
+            changed = shutdown.changed() => {
+                return !(changed.is_ok() && *shutdown.borrow());
+            }
+        };
+        match lifecycle {
+            Ok(lifecycle) => {
+                let finished = await_trigger_finished(lifecycle);
+                tokio::pin!(finished);
+                tokio::select! {
+                    result = &mut finished => {
+                        match result {
+                            Ok(report) => self.record_outcome(report),
+                            Err(error) => warn!(
+                                account = %self.account,
+                                mailbox = %self.mailbox,
+                                %error,
+                                "notification command did not report completion"
+                            ),
+                        }
+                        true
+                    }
+                    changed = shutdown.changed() => {
+                        !(changed.is_ok() && *shutdown.borrow())
+                    }
                 }
+            }
+            Err(error) => {
                 error!(
                     account = %self.account,
                     mailbox = %self.mailbox,
                     %error,
-                    "notification command could not run"
+                    "notification command could not be submitted"
                 );
+                true
             }
         }
     }
 
-    fn record_outcome(&self, outcome: CommandOutcome) {
-        if let Some(state) = &self.state {
-            state.mark_command_finished(&self.runner_id, &outcome);
-        }
-        if outcome.success {
+    fn record_outcome(&self, report: CommandRunReport) {
+        if report.success() {
             info!(
                 account = %self.account,
                 mailbox = %self.mailbox,
-                status = %outcome.description(),
+                status = %report.description(),
                 "notification command succeeded"
             );
         } else {
             warn!(
                 account = %self.account,
                 mailbox = %self.mailbox,
-                status = %outcome.description(),
+                status = %report.description(),
                 "notification command failed"
             );
         }
@@ -187,7 +196,8 @@ async fn sleep_or_shutdown(duration: Duration, shutdown: &mut watch::Receiver<bo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::command::CommandRunFuture;
+    use crate::command::CommandOutcome;
+    use crate::lane::CommandLifecycle;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::time::{Instant, timeout};
 
@@ -212,24 +222,38 @@ mod tests {
         }
     }
 
-    impl CommandExecutor for TestExecutor {
-        fn run(&self, _shutdown: watch::Receiver<bool>) -> CommandRunFuture {
+    impl CommandTriggerTarget for TestExecutor {
+        fn start(&self) -> crate::lane::CommandTriggerStartFuture {
             let this = self.clone();
             Box::pin(async move {
-                this.calls.fetch_add(1, Ordering::SeqCst);
-                let active = this.active.fetch_add(1, Ordering::SeqCst) + 1;
-                this.max_active.fetch_max(active, Ordering::SeqCst);
-                sleep(this.sleep).await;
-                this.active.fetch_sub(1, Ordering::SeqCst);
-                Ok(CommandOutcome {
-                    success: this.success,
-                    code: Some(if this.success { 0 } else { 1 }),
-                    signal: None,
-                    timed_out: false,
-                    cancelled: false,
-                    timeout: None,
-                })
+                let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
+                tokio::spawn(async move {
+                    let _ = lifecycle_tx.send(CommandLifecycle::Started);
+                    let outcome = this.run_fake_command().await;
+                    let _ = lifecycle_tx.send(CommandLifecycle::Finished(
+                        CommandRunReport::Outcome(outcome),
+                    ));
+                });
+                Ok(lifecycle_rx)
             })
+        }
+    }
+
+    impl TestExecutor {
+        async fn run_fake_command(self) -> CommandOutcome {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(active, Ordering::SeqCst);
+            sleep(self.sleep).await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            CommandOutcome {
+                success: self.success,
+                code: Some(if self.success { 0 } else { 1 }),
+                signal: None,
+                timed_out: false,
+                cancelled: false,
+                timeout: None,
+            }
         }
     }
 

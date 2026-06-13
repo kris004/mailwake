@@ -8,6 +8,7 @@ use thiserror::Error;
 use tracing::warn;
 
 pub const DEFAULT_DEBOUNCE_SECONDS: u64 = 10;
+pub const DEFAULT_MAX_DEBOUNCE_SECONDS: u64 = 60;
 pub const DEFAULT_IMAPS_PORT: u16 = 993;
 pub const DEFAULT_IDLE_REFRESH_SECONDS: u64 = 29 * 60;
 pub const DEFAULT_WATCHER_STALE_SECONDS: u64 = 60 * 60;
@@ -23,6 +24,8 @@ pub const DEFAULT_MIN_COMMAND_INTERVAL_SECONDS: u64 = 60;
 pub struct Config {
     #[serde(default)]
     pub default_debounce_seconds: Option<u64>,
+    #[serde(default)]
+    pub default_max_debounce_seconds: Option<u64>,
     #[serde(default)]
     pub capture_command_output: Option<bool>,
     #[serde(default)]
@@ -45,6 +48,10 @@ pub struct Config {
     pub idle_refresh_seconds: Option<u64>,
     #[serde(default)]
     pub accounts: Vec<AccountConfig>,
+    #[serde(default)]
+    pub commands: Vec<CommandConfig>,
+    #[serde(default)]
+    pub sources: Vec<SourceConfig>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -115,6 +122,53 @@ pub struct MailboxConfig {
     pub on_notify: String,
     #[serde(default)]
     pub debounce_seconds: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommandConfig {
+    pub name: String,
+    #[serde(default)]
+    pub lane: Option<String>,
+    pub cmd: String,
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub min_interval_seconds: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SourceConfig {
+    ImapIdle(ImapIdleSourceConfig),
+    FsState(FsStateSourceConfig),
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImapIdleSourceConfig {
+    pub name: String,
+    pub account: String,
+    pub mailbox: String,
+    pub on_event: String,
+    #[serde(default)]
+    pub debounce_seconds: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FsStateSourceConfig {
+    pub name: String,
+    pub watch_paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub recursive: Option<bool>,
+    #[serde(default)]
+    pub state_cmd: Option<String>,
+    pub on_change: String,
+    #[serde(default)]
+    pub debounce_seconds: Option<u64>,
+    #[serde(default)]
+    pub max_debounce_seconds: Option<u64>,
 }
 
 #[derive(Debug, Error)]
@@ -194,12 +248,18 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.accounts.is_empty() {
+        if self.source_count() == 0 {
             return Err(ConfigError::Invalid(
-                "at least one [[accounts]] entry is required".to_string(),
+                "at least one source is required: configure [[accounts.mailboxes]] or [[sources]]"
+                    .to_string(),
             ));
         }
 
+        validate_nonzero_seconds(
+            "default_max_debounce_seconds",
+            self.default_max_debounce_seconds
+                .unwrap_or(DEFAULT_MAX_DEBOUNCE_SECONDS),
+        )?;
         validate_nonzero_seconds(
             "auth_helper_timeout_seconds",
             self.auth_helper_timeout_seconds
@@ -253,13 +313,16 @@ impl Config {
             )));
         }
 
+        let command_names = self.validate_commands()?;
+
         let mut account_names = HashSet::new();
+        let mut source_names = HashSet::new();
         for account in &self.accounts {
             validate_nonempty("account name", &account.name)?;
             validate_nonempty("account host", &account.host)?;
             validate_nonempty("account username", &account.username)?;
             validate_no_crlf("account username", &account.username)?;
-            if !account_names.insert(account.name.as_str()) {
+            if !account_names.insert(account.name.clone()) {
                 return Err(ConfigError::Invalid(format!(
                     "duplicate account name {:?}",
                     account.name
@@ -271,12 +334,6 @@ impl Config {
                     account.name
                 )));
             }
-            if account.mailboxes.is_empty() {
-                return Err(ConfigError::Invalid(format!(
-                    "account {:?} must define at least one [[accounts.mailboxes]] entry",
-                    account.name
-                )));
-            }
             account.validate_auth()?;
 
             let mut mailbox_names = HashSet::new();
@@ -284,6 +341,17 @@ impl Config {
                 validate_nonempty("mailbox name", &mailbox.name)?;
                 validate_no_crlf("mailbox name", &mailbox.name)?;
                 validate_nonempty("mailbox on_notify", &mailbox.on_notify)?;
+                let source_name = legacy_source_name(&account.name, &mailbox.name);
+                if command_names.contains(&source_name) {
+                    return Err(ConfigError::Invalid(format!(
+                        "command name {source_name:?} collides with legacy mailbox source name"
+                    )));
+                }
+                if !source_names.insert(source_name.clone()) {
+                    return Err(ConfigError::Invalid(format!(
+                        "duplicate source name {source_name:?}"
+                    )));
+                }
                 if !mailbox_names.insert(mailbox.name.as_str()) {
                     return Err(ConfigError::Invalid(format!(
                         "account {:?} has duplicate mailbox {:?}",
@@ -293,13 +361,45 @@ impl Config {
             }
         }
 
+        for source in &self.sources {
+            source.validate(&account_names, &command_names, &mut source_names, self)?;
+        }
+
         Ok(())
+    }
+
+    fn validate_commands(&self) -> Result<HashSet<String>, ConfigError> {
+        let mut command_names = HashSet::new();
+        for command in &self.commands {
+            validate_nonempty("command name", &command.name)?;
+            validate_nonempty("command cmd", &command.cmd)?;
+            if let Some(lane) = &command.lane {
+                validate_nonempty("command lane", lane)?;
+            }
+            if let Some(timeout) = command.timeout_seconds {
+                validate_nonzero_seconds("command timeout_seconds", timeout)?;
+            }
+            if !command_names.insert(command.name.clone()) {
+                return Err(ConfigError::Invalid(format!(
+                    "duplicate command name {:?}",
+                    command.name
+                )));
+            }
+        }
+        Ok(command_names)
     }
 
     pub fn default_debounce(&self) -> Duration {
         Duration::from_secs(
             self.default_debounce_seconds
                 .unwrap_or(DEFAULT_DEBOUNCE_SECONDS),
+        )
+    }
+
+    pub fn default_max_debounce(&self) -> Duration {
+        Duration::from_secs(
+            self.default_max_debounce_seconds
+                .unwrap_or(DEFAULT_MAX_DEBOUNCE_SECONDS),
         )
     }
 
@@ -370,6 +470,27 @@ impl Config {
             .sum()
     }
 
+    pub fn source_count(&self) -> usize {
+        self.mailbox_count() + self.sources.len()
+    }
+
+    pub fn command_count(&self) -> usize {
+        self.mailbox_count() + self.commands.len()
+    }
+
+    pub fn command_lane_count(&self) -> usize {
+        let mut lanes = HashSet::new();
+        for account in &self.accounts {
+            for mailbox in &account.mailboxes {
+                lanes.insert(legacy_source_name(&account.name, &mailbox.name));
+            }
+        }
+        for command in &self.commands {
+            lanes.insert(command.lane_name().to_string());
+        }
+        lanes.len()
+    }
+
     pub fn warn_for_insecure_options(&self) {
         if self.default_debounce_seconds == Some(0) {
             warn!("default_debounce_seconds=0 disables global debounce by explicit configuration");
@@ -409,6 +530,31 @@ impl Config {
                         "debounce_seconds=0 disables debounce for this mailbox by explicit configuration"
                     );
                 }
+            }
+        }
+        for source in &self.sources {
+            match source {
+                SourceConfig::ImapIdle(source) if source.debounce_seconds == Some(0) => {
+                    warn!(
+                        source = %source.name,
+                        "debounce_seconds=0 disables debounce for this IMAP IDLE source by explicit configuration"
+                    );
+                }
+                SourceConfig::FsState(source) => {
+                    if source.debounce_seconds == Some(0) {
+                        warn!(
+                            source = %source.name,
+                            "debounce_seconds=0 disables debounce for this fs_state source by explicit configuration"
+                        );
+                    }
+                    if source.recursive() {
+                        warn!(
+                            source = %source.name,
+                            "recursive filesystem watching is explicitly enabled; avoid huge trees"
+                        );
+                    }
+                }
+                SourceConfig::ImapIdle(_) => {}
             }
         }
     }
@@ -455,11 +601,139 @@ impl MailboxConfig {
     }
 }
 
+impl CommandConfig {
+    pub fn lane_name(&self) -> &str {
+        self.lane.as_deref().unwrap_or(&self.name)
+    }
+
+    pub fn timeout(&self, config: &Config) -> Duration {
+        self.timeout_seconds
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| config.command_timeout())
+    }
+
+    pub fn min_interval(&self, config: &Config) -> Duration {
+        self.min_interval_seconds
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| config.min_command_interval())
+    }
+}
+
+impl SourceConfig {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::ImapIdle(source) => &source.name,
+            Self::FsState(source) => &source.name,
+        }
+    }
+
+    fn validate(
+        &self,
+        account_names: &HashSet<String>,
+        command_names: &HashSet<String>,
+        source_names: &mut HashSet<String>,
+        config: &Config,
+    ) -> Result<(), ConfigError> {
+        validate_nonempty("source name", self.name())?;
+        let source_name = self.name().to_string();
+        if !source_names.insert(source_name.clone()) {
+            return Err(ConfigError::Invalid(format!(
+                "duplicate source name {source_name:?}"
+            )));
+        }
+
+        match self {
+            Self::ImapIdle(source) => {
+                validate_nonempty("source account", &source.account)?;
+                validate_nonempty("source mailbox", &source.mailbox)?;
+                validate_no_crlf("source mailbox", &source.mailbox)?;
+                validate_nonempty("source on_event", &source.on_event)?;
+                if !account_names.contains(source.account.as_str()) {
+                    return Err(ConfigError::Invalid(format!(
+                        "source {:?} references unknown account {:?}",
+                        source.name, source.account
+                    )));
+                }
+                validate_command_reference("on_event", &source.on_event, command_names)?;
+            }
+            Self::FsState(source) => {
+                validate_nonempty("source on_change", &source.on_change)?;
+                validate_command_reference("on_change", &source.on_change, command_names)?;
+                if source.watch_paths.is_empty() {
+                    return Err(ConfigError::Invalid(format!(
+                        "fs_state source {:?} must define at least one watch_paths entry",
+                        source.name
+                    )));
+                }
+                for path in &source.watch_paths {
+                    if path.as_os_str().is_empty() {
+                        return Err(ConfigError::Invalid(format!(
+                            "fs_state source {:?} has an empty watch path",
+                            source.name
+                        )));
+                    }
+                }
+                if let Some(command) = &source.state_cmd {
+                    validate_nonempty("source state_cmd", command)?;
+                }
+                if let Some(max_debounce) = source.max_debounce_seconds {
+                    validate_nonzero_seconds("source max_debounce_seconds", max_debounce)?;
+                }
+                let _ = source.max_debounce(config);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ImapIdleSourceConfig {
+    pub fn debounce(&self, config: &Config) -> Duration {
+        self.debounce_seconds
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| config.default_debounce())
+    }
+}
+
+impl FsStateSourceConfig {
+    pub fn recursive(&self) -> bool {
+        self.recursive.unwrap_or(false)
+    }
+
+    pub fn debounce(&self, config: &Config) -> Duration {
+        self.debounce_seconds
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| config.default_debounce())
+    }
+
+    pub fn max_debounce(&self, config: &Config) -> Duration {
+        self.max_debounce_seconds
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| config.default_max_debounce())
+    }
+}
+
 fn validate_nonempty(field: &str, value: &str) -> Result<(), ConfigError> {
     if value.trim().is_empty() {
         return Err(ConfigError::Invalid(format!("{field} must not be empty")));
     }
     Ok(())
+}
+
+fn validate_command_reference(
+    field: &str,
+    command: &str,
+    command_names: &HashSet<String>,
+) -> Result<(), ConfigError> {
+    if !command_names.contains(command) {
+        return Err(ConfigError::Invalid(format!(
+            "{field} references unknown command {command:?}"
+        )));
+    }
+    Ok(())
+}
+
+pub fn legacy_source_name(account: &str, mailbox: &str) -> String {
+    format!("{account}/{mailbox}")
 }
 
 fn validate_no_crlf(field: &str, value: &str) -> Result<(), ConfigError> {
@@ -543,6 +817,9 @@ debounce_seconds = 10
         let config = Config::parse_str(VALID_XOAUTH2).expect("config should parse");
         assert_eq!(config.accounts.len(), 1);
         assert_eq!(config.mailbox_count(), 1);
+        assert_eq!(config.source_count(), 1);
+        assert_eq!(config.command_count(), 1);
+        assert_eq!(config.command_lane_count(), 1);
         assert_eq!(config.accounts[0].auth, AuthMethod::Xoauth2Cmd);
         assert_eq!(config.accounts[0].port(), 993);
         assert_eq!(config.auth_helper_timeout().as_secs(), 30);
@@ -579,7 +856,7 @@ xoauth2_cmd = "gmail-oauth-token"
 [[accounts]]
 name = "gmail"
 host = "imap.gmail.com"
-username = "me@example.com"
+username = "user@example.com"
 auth = "xoauth2_cmd"
 password_cmd = "pass show mail/gmail"
 
@@ -649,7 +926,7 @@ password = 123
 [[accounts]]
 name = "gmail"
 host = "imap.gmail.com"
-username = "me@example.com"
+username = "user@example.com"
 auth = "xoauth2_cmd"
 xoauth2_cmd = "gmail-oauth-token"
 
@@ -673,7 +950,7 @@ watcher_stale_seconds = 120
 [[accounts]]
 name = "gmail"
 host = "imap.gmail.com"
-username = "me@example.com"
+username = "user@example.com"
 auth = "xoauth2_cmd"
 xoauth2_cmd = "gmail-oauth-token"
 
@@ -693,7 +970,7 @@ watcher_stale_seconds = 119
 [[accounts]]
 name = "gmail"
 host = "imap.gmail.com"
-username = "me@example.com"
+username = "user@example.com"
 auth = "xoauth2_cmd"
 xoauth2_cmd = "gmail-oauth-token"
 
@@ -716,7 +993,7 @@ min_command_interval_seconds = 0
 [[accounts]]
 name = "gmail"
 host = "imap.gmail.com"
-username = "me@example.com"
+username = "user@example.com"
 auth = "xoauth2_cmd"
 xoauth2_cmd = "gmail-oauth-token"
 
@@ -738,7 +1015,7 @@ debounce_seconds = 0
     #[test]
     fn rejects_crlf_in_imap_command_strings() {
         for (field, bad_line) in [
-            ("username", "username = \"me\\n@example.com\""),
+            ("username", "username = \"user\\n@example.com\""),
             ("mailbox", "name = \"IN\\rBOX\""),
         ] {
             let config = match field {
@@ -761,7 +1038,7 @@ on_notify = "echo sync"
 [[accounts]]
 name = "gmail"
 host = "imap.gmail.com"
-username = "me@example.com"
+username = "user@example.com"
 auth = "xoauth2_cmd"
 xoauth2_cmd = "gmail-oauth-token"
 
@@ -808,7 +1085,7 @@ log_command_output = true
 [[accounts]]
 name = "gmail"
 host = "imap.gmail.com"
-username = "me@example.com"
+username = "user@example.com"
 auth = "xoauth2_cmd"
 xoauth2_cmd = "gmail-oauth-token"
 
@@ -831,7 +1108,7 @@ log_command_output = true
 [[accounts]]
 name = "gmail"
 host = "imap.gmail.com"
-username = "me@example.com"
+username = "user@example.com"
 auth = "xoauth2_cmd"
 xoauth2_cmd = "gmail-oauth-token"
 
@@ -842,5 +1119,166 @@ on_notify = "echo sync"
         )
         .expect_err("ambiguous output capture fields should fail");
         assert!(err.to_string().contains("capture_command_output"));
+    }
+
+    #[test]
+    fn parses_generic_fs_state_source_without_mail_semantics() {
+        let config = Config::parse_str(
+            r#"
+default_debounce_seconds = 5
+default_max_debounce_seconds = 60
+
+[[commands]]
+name = "local-push"
+lane = "sync"
+cmd = "echo push"
+timeout_seconds = 30
+min_interval_seconds = 0
+
+[[sources]]
+name = "local-state"
+type = "fs_state"
+watch_paths = ["/tmp/app-state"]
+state_cmd = "cat /tmp/app-state/version"
+on_change = "local-push"
+"#,
+        )
+        .expect("fs_state-only config should parse");
+
+        assert!(config.accounts.is_empty());
+        assert_eq!(config.source_count(), 1);
+        assert_eq!(config.command_count(), 1);
+        assert_eq!(config.command_lane_count(), 1);
+        let SourceConfig::FsState(source) = &config.sources[0] else {
+            panic!("source should be fs_state");
+        };
+        assert!(!source.recursive());
+        assert_eq!(source.debounce(&config).as_secs(), 5);
+        assert_eq!(source.max_debounce(&config).as_secs(), 60);
+    }
+
+    #[test]
+    fn recursive_defaults_to_false_and_must_be_explicit() {
+        let config = Config::parse_str(
+            r#"
+[[commands]]
+name = "changed"
+cmd = "echo changed"
+
+[[sources]]
+name = "nonrecursive"
+type = "fs_state"
+watch_paths = ["/tmp/state"]
+on_change = "changed"
+
+[[sources]]
+name = "recursive"
+type = "fs_state"
+watch_paths = ["/tmp/tree"]
+recursive = true
+on_change = "changed"
+"#,
+        )
+        .expect("fs_state recursive config should parse");
+
+        let SourceConfig::FsState(nonrecursive) = &config.sources[0] else {
+            panic!("source should be fs_state");
+        };
+        let SourceConfig::FsState(recursive) = &config.sources[1] else {
+            panic!("source should be fs_state");
+        };
+        assert!(!nonrecursive.recursive());
+        assert!(recursive.recursive());
+    }
+
+    #[test]
+    fn imap_and_fs_state_sources_can_share_a_command_lane() {
+        let config = Config::parse_str(
+            r#"
+[[accounts]]
+name = "gmail"
+host = "imap.gmail.com"
+username = "user@example.com"
+auth = "xoauth2_cmd"
+xoauth2_cmd = "gmail-oauth-token"
+
+[[commands]]
+name = "remote-sync"
+lane = "gmail-sync"
+cmd = "echo remote"
+
+[[commands]]
+name = "local-push"
+lane = "gmail-sync"
+cmd = "echo local"
+
+[[sources]]
+name = "remote-inbox"
+type = "imap_idle"
+account = "gmail"
+mailbox = "INBOX"
+on_event = "remote-sync"
+
+[[sources]]
+name = "local-state"
+type = "fs_state"
+watch_paths = ["/tmp/not-a-maildir"]
+state_cmd = "cat /tmp/state-version"
+on_change = "local-push"
+"#,
+        )
+        .expect("shared lane config should parse");
+
+        assert_eq!(config.source_count(), 2);
+        assert_eq!(config.command_count(), 2);
+        assert_eq!(config.command_lane_count(), 1);
+    }
+
+    #[test]
+    fn sources_must_reference_configured_commands() {
+        let err = Config::parse_str(
+            r#"
+[[sources]]
+name = "local-state"
+type = "fs_state"
+watch_paths = ["/tmp/state"]
+on_change = "missing"
+"#,
+        )
+        .expect_err("missing command reference should fail");
+        assert!(err.to_string().contains("unknown command"));
+    }
+
+    #[test]
+    fn named_commands_must_not_collide_with_legacy_mailbox_commands() {
+        let err = Config::parse_str(
+            r#"
+[[accounts]]
+name = "gmail"
+host = "imap.gmail.com"
+username = "user@example.com"
+auth = "xoauth2_cmd"
+xoauth2_cmd = "gmail-oauth-token"
+
+[[accounts.mailboxes]]
+name = "INBOX"
+on_notify = "echo legacy"
+
+[[commands]]
+name = "gmail/INBOX"
+cmd = "echo named"
+"#,
+        )
+        .expect_err("legacy synthetic command name collision should fail");
+        assert!(err.to_string().contains("collides"));
+    }
+
+    #[test]
+    fn no_notmuch_dependency_is_declared() {
+        let manifest = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"),
+        )
+        .expect("read Cargo.toml");
+        assert!(!manifest.to_ascii_lowercase().contains("notmuch"));
     }
 }

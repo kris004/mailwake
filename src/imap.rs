@@ -660,7 +660,7 @@ mod tests {
 
     #[test]
     fn xoauth2_response_does_not_contain_plain_token() {
-        let response = xoauth2_response("me@example.com", "secret-token");
+        let response = xoauth2_response("user@example.com", "secret-token");
         assert!(!response.contains("secret-token"));
         let decoded = BASE64.decode(response).expect("valid base64");
         assert!(String::from_utf8(decoded).unwrap().contains("secret-token"));
@@ -677,8 +677,8 @@ mod tests {
 
     #[test]
     fn rejects_crlf_in_imap_strings() {
-        assert!(validate_imap_string("username", "me@example.com").is_ok());
-        assert!(validate_imap_string("username", "me\n@example.com").is_err());
+        assert!(validate_imap_string("username", "user@example.com").is_ok());
+        assert!(validate_imap_string("username", "user\n@example.com").is_err());
         assert!(validate_imap_string("mailbox name", "IN\rBOX").is_err());
         assert!(validate_imap_string("password", "secret\nnext").is_err());
     }

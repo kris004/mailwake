@@ -407,7 +407,7 @@ mod tests {
 [[accounts]]
 name = "gmail"
 host = "imap.gmail.com"
-username = "me@example.com"
+username = "user@example.com"
 auth = "xoauth2_cmd"
 xoauth2_cmd = "sh -c 'touch {}'"
 

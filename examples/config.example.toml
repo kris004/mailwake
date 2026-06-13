@@ -1,0 +1,48 @@
+# Example mailwake config. Replace every path, email address, and command with
+# values for your own machine before using it.
+
+# mailwake is generic: sources produce wake-up signals, commands run in lanes.
+default_debounce_seconds = 10
+default_max_debounce_seconds = 60
+command_timeout_seconds = 300
+min_command_interval_seconds = 60
+
+[[commands]]
+name = "remote-sync"
+lane = "example-sync"
+cmd = "cd /home/alice/.mail/example && flock -n .sync.lock gmi sync && notmuch new"
+timeout_seconds = 300
+min_interval_seconds = 60
+
+[[commands]]
+name = "local-push"
+lane = "example-sync"
+cmd = "cd /home/alice/.mail/example && flock -n .sync.lock gmi push"
+timeout_seconds = 300
+min_interval_seconds = 30
+
+[[accounts]]
+name = "example-imap"
+host = "imap.gmail.com"
+port = 993
+username = "user@example.com"
+auth = "xoauth2_cmd"
+xoauth2_cmd = "/home/alice/.local/bin/gmail-oauth-token"
+
+[[sources]]
+name = "remote-inbox"
+type = "imap_idle"
+account = "example-imap"
+mailbox = "INBOX"
+on_event = "remote-sync"
+debounce_seconds = 10
+
+[[sources]]
+name = "local-state"
+type = "fs_state"
+watch_paths = ["/home/alice/.mail/example/.notmuch"]
+recursive = false
+state_cmd = "notmuch count --lastmod"
+on_change = "local-push"
+debounce_seconds = 5
+max_debounce_seconds = 60

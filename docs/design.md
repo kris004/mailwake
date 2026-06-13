@@ -3,20 +3,24 @@
 `mailwake` is intentionally a narrow bridge:
 
 ```text
-IMAP IDLE event -> debounce/coalesce/cooldown -> shell command
+event source -> debounce/coalesce/cooldown -> command lane -> shell command
 ```
 
-It does not sync mail, store mail, understand Gmail labels, or manage OAuth. Mail
-sync tools, password managers, and OAuth helpers stay outside the daemon.
+It does not sync mail, store mail, understand Gmail labels, interpret local
+state, or manage OAuth. Sync tools, password managers, state fingerprint
+commands, and OAuth helpers stay outside the daemon.
 
 ## Shape
 
-- One Tokio task watches each configured account/mailbox pair.
+- One Tokio task watches each configured source.
 - Each watcher uses one IMAP connection because IMAP IDLE operates on the
   selected mailbox for that connection.
-- Each mailbox has a dedicated debounce/command task.
-- Commands for the same mailbox are serialized by that task; overlapping runs are
-  impossible in normal operation.
+- `fs_state` watchers use `notify` as a wake-up signal. Filesystem events are
+  coalesced before an optional opaque `state_cmd` comparison.
+- IMAP source debounce and fs_state state comparison submit command requests to
+  command lanes.
+- Commands in the same lane are serialized and repeated requests for the same
+  command are coalesced.
 - Authentication secrets are obtained on connection/reconnection with a bounded
   helper timeout/output cap and wrapped in a redacted secret type. Helpers run
   only after TCP/TLS connect and server greeting succeed.
@@ -25,8 +29,9 @@ sync tools, password managers, and OAuth helpers stay outside the daemon.
 - Auth helpers and notification commands run in separate Unix process groups.
   Timeout and shutdown paths terminate the whole process group and reap the
   shell.
-- A post-command cooldown coalesces events that arrive immediately after a
-  command run, which helps avoid self-trigger loops from sync/index commands.
+- Per-command cooldowns coalesce events that arrive immediately after a command
+  run. `fs_state` sources also rebaseline after their own command finishes so
+  command-caused filesystem writes do not self-trigger.
 
 ## Authentication
 
@@ -59,11 +64,10 @@ Config parsing and auth-helper path checks happen before `READY=1`. The daemon
 intentionally avoids a separate auth-helper execution preflight so startup does
 not double-run OAuth/password helpers. Helper execution happens in watcher tasks
 and is bounded by `auth_helper_timeout_seconds`. With `--initial-connect-required`,
-readiness also waits for every watcher to complete one successful
-login/select/IDLE setup.
+readiness also waits for every watcher to complete initial setup; for IMAP that
+means one successful login/select/IDLE setup.
 
 Systemd notification is opportunistic. Without `NOTIFY_SOCKET`, `mailwake` runs
-normally. Watchdog pings are sent only while the supervisor believes every IMAP
-watcher task is either connected/idling or progressing through its reconnect
-loop, every command runner task is alive, and no command has exceeded its
-configured timeout.
+normally. Watchdog pings are sent only while the supervisor believes every source
+watcher task is alive and making progress, every command lane task is alive, and
+no command has exceeded its configured timeout.

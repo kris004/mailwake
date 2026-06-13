@@ -1,2 +1,6 @@
 /target/
 /*.zip
+config.toml
+*.local.toml
+examples/*.local.toml
+.env

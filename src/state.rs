@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 #[derive(Debug)]
 pub struct RuntimeState {
     total_accounts: usize,
-    total_mailboxes: usize,
+    total_sources: usize,
+    total_command_lanes: usize,
     watcher_stale: Duration,
     command_timeout: Duration,
     inner: Mutex<RuntimeInner>,
@@ -85,13 +86,15 @@ struct CommandRunnerStatus {
 impl RuntimeState {
     pub fn new(
         total_accounts: usize,
-        total_mailboxes: usize,
+        total_sources: usize,
+        total_command_lanes: usize,
         watcher_stale: Duration,
         command_timeout: Duration,
     ) -> Self {
         Self {
             total_accounts,
-            total_mailboxes,
+            total_sources,
+            total_command_lanes,
             watcher_stale,
             command_timeout,
             inner: Mutex::new(RuntimeInner {
@@ -103,8 +106,8 @@ impl RuntimeState {
         }
     }
 
-    pub fn total_mailboxes(&self) -> usize {
-        self.total_mailboxes
+    pub fn total_sources(&self) -> usize {
+        self.total_sources
     }
 
     pub fn register_watcher(&self, id: impl Into<String>) {
@@ -219,8 +222,8 @@ impl RuntimeState {
             None => "no command runs yet",
         };
         format!(
-            "watching {} account(s), {} mailbox(es); {event_text}; {command_text}",
-            self.total_accounts, self.total_mailboxes
+            "watching {} account(s), {} source(s); {event_text}; {command_text}",
+            self.total_accounts, self.total_sources
         )
     }
 
@@ -230,7 +233,7 @@ impl RuntimeState {
     }
 
     fn watchers_healthy(&self, inner: &RuntimeInner) -> bool {
-        if inner.watchers.len() != self.total_mailboxes {
+        if inner.watchers.len() != self.total_sources {
             return false;
         }
         inner.watchers.values().all(|watcher| {
@@ -242,7 +245,7 @@ impl RuntimeState {
     }
 
     fn command_runners_healthy(&self, inner: &RuntimeInner) -> bool {
-        if inner.command_runners.len() != self.total_mailboxes {
+        if inner.command_runners.len() != self.total_command_lanes {
             return false;
         }
         inner.command_runners.values().all(|runner| {
@@ -267,7 +270,7 @@ mod tests {
     use super::*;
 
     fn healthy_state() -> RuntimeState {
-        let state = RuntimeState::new(1, 1, Duration::from_secs(60), Duration::from_millis(50));
+        let state = RuntimeState::new(1, 1, 1, Duration::from_secs(60), Duration::from_millis(50));
         state.register_watcher("gmail/INBOX");
         state.register_command_runner("gmail/INBOX");
         state
@@ -277,8 +280,8 @@ mod tests {
     fn status_message_has_only_counts_and_generic_state() {
         let state = healthy_state();
         let status = state.status_message();
-        assert!(status.contains("watching 1 account(s), 1 mailbox(es)"));
-        assert!(!status.contains("user"));
+        assert!(status.contains("watching 1 account(s), 1 source(s)"));
+        assert!(!status.contains("private-address"));
         assert!(!status.contains("gmail-oauth-token"));
         assert!(!status.contains("gmi sync"));
     }
@@ -293,7 +296,7 @@ mod tests {
 
     #[test]
     fn missing_command_runner_is_unhealthy() {
-        let state = RuntimeState::new(1, 1, Duration::from_secs(60), Duration::from_millis(50));
+        let state = RuntimeState::new(1, 1, 1, Duration::from_secs(60), Duration::from_millis(50));
         state.register_watcher("gmail/INBOX");
         assert!(!state.is_healthy());
     }

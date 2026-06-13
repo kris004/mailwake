@@ -1,15 +1,16 @@
 # mailwake
 
-`mailwake` is a tiny IMAP IDLE daemon. It connects to one or more IMAP
-accounts, waits for mailbox change notifications, debounces/coalesces those
-notifications, and runs configured shell commands.
+`mailwake` is a tiny event-driven command trigger. It watches configured event
+sources, debounces/coalesces noisy notifications, and runs configured shell
+commands.
 
 ```text
-IMAP IDLE event -> debounce/coalesce/cooldown -> run configured command
+event source -> debounce/coalesce/cooldown -> command lane -> run configured command
 ```
 
-The primary use case is Gmail + lieer/gmailieer + notmuch + aerc: let Gmail wake
-up the local sync/index stack when new mail or mailbox state changes arrive.
+IMAP IDLE is one source type. `fs_state` is another source type for local
+filesystem/state changes. The daemon intentionally treats both as wake-up
+signals, not as work-item queues.
 
 ## Non-goals
 
@@ -20,9 +21,10 @@ up the local sync/index stack when new mail or mailbox state changes arrive.
 - implement a mail client;
 - know about lieer, notmuch, mbsync, Gmail labels, Maildir, or aerc internals;
 - implement a browser/device-code OAuth flow;
-- act as a general automation framework.
+- act as a general automation framework;
+- recursively crawl or sync local filesystem trees.
 
-Keep the daemon boring: IMAP IDLE in, command out.
+Keep the daemon boring: event in, command out.
 
 ## Authentication model
 
@@ -120,6 +122,7 @@ Useful global knobs:
 ```toml
 # Defaults shown.
 default_debounce_seconds = 10
+default_max_debounce_seconds = 60
 auth_helper_timeout_seconds = 30
 auth_helper_max_output_bytes = 65536
 command_timeout_seconds = 300
@@ -141,8 +144,30 @@ self-trigger loops. If events arrive during the cooldown, they are coalesced and
 one command run is scheduled after the cooldown/debounce rules allow it. Set it
 to `0` only if you intentionally want no cooldown.
 
+Named commands may override the global timeout/cooldown and may share a lane:
+
+```toml
+[[commands]]
+name = "remote-sync"
+lane = "mail-sync"
+cmd = "sync-remote"
+timeout_seconds = 300
+min_interval_seconds = 60
+
+[[commands]]
+name = "local-push"
+lane = "mail-sync"
+cmd = "push-local"
+timeout_seconds = 300
+min_interval_seconds = 30
+```
+
+Only one command in a lane runs at a time. Repeated requests for the same
+command while the lane is busy are coalesced into one follow-up run. Commands in
+different lanes can run independently.
+
 `debounce_seconds = 0` is allowed when explicitly configured, but it means every
-observed mailbox event can trigger command execution as soon as cooldown and the
+observed source event can trigger command execution as soon as cooldown and the
 previous run permit.
 
 `capture_command_output` is normally false. If enabled, `mailwake` captures
@@ -153,6 +178,68 @@ warning.
 Usernames, mailbox names, and direct LOGIN passwords must not contain CR/LF.
 This prevents unsafe IMAP command construction before anything is sent to the
 server.
+
+Legacy `[[accounts.mailboxes]]` entries with `on_notify = "..."` remain
+supported. New configs can instead define named `[[commands]]` and top-level
+`[[sources]]` entries:
+
+```toml
+[[sources]]
+name = "remote-inbox"
+type = "imap_idle"
+account = "gmail"
+mailbox = "INBOX"
+on_event = "remote-sync"
+debounce_seconds = 10
+```
+
+## `fs_state` sources
+
+`fs_state` watches one or more configured files/directories for noisy filesystem
+changes. Filesystem events are interrupts, not work items: many filesystem
+events are coalesced into one settled state check.
+
+```toml
+[[sources]]
+name = "local-state"
+type = "fs_state"
+watch_paths = ["/home/alice/.mail/example/.notmuch"]
+recursive = false
+state_cmd = "notmuch count --lastmod"
+on_change = "local-push"
+debounce_seconds = 5
+max_debounce_seconds = 60
+```
+
+On startup, if `state_cmd` is set, `mailwake` runs it once and saves stdout as an
+opaque baseline after trimming trailing newlines. It does not interpret or log
+the full output. After a settled filesystem batch, `mailwake` runs `state_cmd`
+once and compares stdout to the previous baseline. If it changed, `mailwake`
+runs `on_change`; after that command finishes, it waits briefly, runs
+`state_cmd` once more, and saves the new baseline. This rebaseline step prevents
+self-trigger loops when the command itself updates watched state.
+
+If no `state_cmd` is configured, any settled filesystem event can trigger
+`on_change`.
+
+Useful `state_cmd` examples:
+
+```sh
+notmuch count --lastmod
+cat state/version
+sqlite3 app.db 'select max(updated_at) from messages'
+sha256sum important-state-file
+```
+
+`mailwake` does not understand any of these outputs; it only compares strings.
+
+Warnings:
+
+- Do not recursively watch large Maildir trees.
+- For notmuch, watch `.notmuch` or another small database/state path, not every
+  email file.
+- For huge mailboxes, rely on coalescing: let the watcher see a small state path
+  and run `state_cmd` once per settled batch.
 
 ## CLI
 
@@ -165,10 +252,11 @@ mailwake --initial-connect-required --config ~/.config/mailwake/config.toml
 ```
 
 `check-config` parses and validates the config, checks simple auth-helper
-executable paths when practical, and does not connect to IMAP, notify systemd,
-run auth helpers, or run mailbox commands. More complex helper commands using
-shell syntax such as `~`, pipes, redirection, `&&`, or `;` are not rejected just
-because static validation cannot prove the executable path.
+executable paths when practical, and does not connect to IMAP, start filesystem
+watchers, notify systemd, run auth helpers, run `state_cmd`, or run configured
+commands. More complex helper commands using shell syntax such as `~`, pipes,
+redirection, `&&`, or `;` are not rejected just because static validation cannot
+prove the executable path.
 
 Prefer absolute paths for `xoauth2_cmd` and `password_cmd`, especially under
 systemd. A user service may not inherit the same `PATH` as your interactive
@@ -176,8 +264,9 @@ shell, so a helper that works in a terminal as `gmail-oauth-token` may fail in
 the service unless configured as `/home/alice/.local/bin/gmail-oauth-token`
 or the service explicitly sets a suitable `PATH`.
 
-`test-command` runs the configured command for one account/mailbox, applies
-`command_timeout_seconds`, and reports the exit status or timeout outcome.
+`test-command` runs the configured command for one account/mailbox, applies the
+configured command timeout, and reports the exit status or timeout outcome. For
+new `imap_idle` sources, it resolves the source's named `on_event` command.
 
 ## Basic setup
 
@@ -190,7 +279,15 @@ mailwake test-command --config ~/.config/mailwake/config.toml --account gmail --
 mailwake --config ~/.config/mailwake/config.toml
 ```
 
+See `examples/config.example.toml` for a complete placeholder config. Copy it to
+a private config path and replace example email addresses, paths, and commands
+with your own values before use.
+
 ## Gmail + lieer + notmuch
+
+This is an example recipe, not the purpose of the tool. `mailwake` does not
+understand Gmail, lieer, notmuch, Maildir, labels, or email semantics; it only
+turns source events into command runs.
 
 Use a Gmail OAuth helper that prints a valid bearer token:
 
@@ -219,16 +316,17 @@ OAuth client JSON under `~/.config/mailwake/`, and stores the `oauth2l` token
 cache under `~/.local/state/mailwake/` instead of oauth2l's default `~/.oauth2l`
 file. Run `--setup` interactively once before starting the systemd service.
 
-Then make the mailbox command run your existing sync/index path:
+For the legacy mailbox config shape, make the mailbox command run your existing
+sync/index path:
 
 ```toml
 on_notify = "cd ~/.mail/example && flock -n .sync.lock gmi sync && notmuch new"
 ```
 
 `flock -n` keeps the sync stack from overlapping itself if something else is
-already syncing. `mailwake` also serializes commands per mailbox and coalesces
-rapid IMAP events. The default post-command cooldown helps avoid loops where a
-sync command itself causes immediate follow-up mailbox notifications.
+already syncing. `mailwake` also serializes commands by lane and coalesces rapid
+source events. The default post-command cooldown helps avoid loops where a sync
+command itself causes immediate follow-up notifications.
 
 ## Command process handling
 
@@ -265,8 +363,8 @@ systemctl --user status mailwake.service
 journalctl --user -u mailwake.service -f
 ```
 
-If your config or `on_notify` commands rely on programs in `~/.local/bin`, add
-or uncomment this in the service:
+If your config commands rely on programs in `~/.local/bin`, add or uncomment
+this in the service:
 
 ```ini
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
@@ -278,22 +376,22 @@ make `check-config` and service startup behavior more predictable.
 The service uses `Type=notify`. With systemd available, `mailwake` sends
 `READY=1` after config parsing, auth-helper executable checks, and watcher task
 spawning. It does not execute OAuth/password helpers as a separate startup
-preflight; helpers run when watchers connect and are bounded by
+preflight; helpers run when IMAP watchers connect and are bounded by
 `auth_helper_timeout_seconds`. With `--initial-connect-required`, readiness waits
-until every watcher completes one successful login/select/IDLE setup before
-`READY=1`.
+until every watcher completes initial setup before `READY=1` (for IMAP, that
+means one successful login/select/IDLE setup).
 
 Readiness is therefore not the same as "currently connected to Gmail" unless
 `--initial-connect-required` is used. Without that flag, network failures are
 handled by the reconnect loop after the service is considered ready.
 
 `WatchdogSec` asks systemd to restart the service if it stops sending watchdog
-pings. `mailwake` sends `WATCHDOG=1` only when IMAP watcher tasks and
-per-mailbox command runner tasks are healthy. Watchers must be alive and either
-connected/idling or progressing through expected reconnect backoff. Command
-runners must be alive and must not have a command running past
-`command_timeout_seconds`. If a task crashes, appears stale, or wedges, watchdog
-pings stop so systemd can restart the service.
+pings. `mailwake` sends `WATCHDOG=1` only when source watcher tasks and command
+lane runner tasks are healthy. Watchers must be alive and either idling or
+progressing through expected reconnect/setup work. Command lanes must be alive
+and must not have a command running past its configured timeout. If a task
+crashes, appears stale, or wedges, watchdog pings stop so systemd can restart
+the service.
 
 If `NOTIFY_SOCKET` and `WATCHDOG_USEC` are absent, `mailwake` runs normally from a
 terminal, cron, OpenRC, or anything else.
