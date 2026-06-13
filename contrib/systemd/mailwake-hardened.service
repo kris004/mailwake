@@ -1,0 +1,24 @@
+[Unit]
+Description=mailwake IMAP IDLE command trigger
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=notify
+ExecStart=%h/.local/bin/mailwake --config %h/.config/mailwake/config.toml
+Restart=always
+RestartSec=10
+WatchdogSec=2min
+TimeoutStartSec=30s
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.mail %h/.cache %h/.local/state %h/.config/mailwake
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=default.target

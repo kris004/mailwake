@@ -1,0 +1,15 @@
+[Unit]
+Description=mailwake IMAP IDLE command trigger
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=notify
+ExecStart=%h/.local/bin/mailwake --config %h/.config/mailwake/config.toml
+Restart=always
+RestartSec=10
+WatchdogSec=2min
+TimeoutStartSec=30s
+
+[Install]
+WantedBy=default.target
