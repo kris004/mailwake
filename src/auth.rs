@@ -462,10 +462,10 @@ on_notify = "echo sync"
     async fn read_pid_file(path: &Path) -> libc::pid_t {
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if let Ok(contents) = fs::read_to_string(path) {
-                    if let Ok(pid) = contents.trim().parse::<libc::pid_t>() {
-                        return pid;
-                    }
+                if let Ok(contents) = fs::read_to_string(path)
+                    && let Ok(pid) = contents.trim().parse::<libc::pid_t>()
+                {
+                    return pid;
                 }
                 sleep(Duration::from_millis(10)).await;
             }
