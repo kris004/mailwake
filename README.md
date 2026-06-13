@@ -147,6 +147,26 @@ auth = "xoauth2_cmd"
 xoauth2_cmd = "gmail-oauth-token"
 ```
 
+### Example oauth2l helper
+
+Google's `oauth2l` can be used as the external token helper. `mailwake` does not
+call `oauth2l` directly; install or adapt the example wrapper instead:
+
+```sh
+install -m 0755 contrib/oauth/gmail-oauth-token-oauth2l ~/.local/bin/gmail-oauth-token
+mkdir -p ~/.config/mailwake ~/.local/state/mailwake
+chmod 700 ~/.local/state/mailwake
+$EDITOR ~/.config/mailwake/google-oauth-client.json
+gmail-oauth-token --setup
+gmail-oauth-token >/tmp/gmail-token-test
+rm /tmp/gmail-token-test
+```
+
+The wrapper uses the IMAP/SMTP Gmail scope `https://mail.google.com/`, stores the
+OAuth client JSON under `~/.config/mailwake/`, and stores the `oauth2l` token
+cache under `~/.local/state/mailwake/` instead of oauth2l's default `~/.oauth2l`
+file. Run `--setup` interactively once before starting the systemd service.
+
 Then make the mailbox command run your existing sync/index path:
 
 ```toml

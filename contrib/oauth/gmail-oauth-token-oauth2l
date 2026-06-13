@@ -1,0 +1,105 @@
+#!/bin/sh
+# Example XOAUTH2 token helper for mailwake using Google's oauth2l CLI.
+#
+# Default paths intentionally follow XDG-style locations instead of oauth2l's
+# default ~/.oauth2l cache:
+#   credentials: ~/.config/mailwake/google-oauth-client.json
+#   token cache: ~/.local/state/mailwake/oauth2l-cache.json
+#
+# First-time interactive setup:
+#   gmail-oauth-token-oauth2l --setup
+#
+# mailwake config:
+#   auth = "xoauth2_cmd"
+#   xoauth2_cmd = "gmail-oauth-token"
+
+set -eu
+
+OAUTH2L=${OAUTH2L:-oauth2l}
+XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-"$HOME/.config"}
+XDG_STATE_HOME=${XDG_STATE_HOME:-"$HOME/.local/state"}
+MAILWAKE_GOOGLE_OAUTH_CLIENT=${MAILWAKE_GOOGLE_OAUTH_CLIENT:-"$XDG_CONFIG_HOME/mailwake/google-oauth-client.json"}
+MAILWAKE_OAUTH2L_CACHE=${MAILWAKE_OAUTH2L_CACHE:-"$XDG_STATE_HOME/mailwake/oauth2l-cache.json"}
+MAILWAKE_GMAIL_SCOPE=${MAILWAKE_GMAIL_SCOPE:-"https://mail.google.com/"}
+
+usage() {
+	cat <<USAGE
+Usage: $(basename "$0") [--setup] [extra oauth2l fetch args...]
+
+Print a fresh Gmail IMAP OAuth2 access token for mailwake.
+
+Environment overrides:
+  OAUTH2L                       oauth2l binary path (default: oauth2l)
+  MAILWAKE_GOOGLE_OAUTH_CLIENT  OAuth client JSON path
+  MAILWAKE_OAUTH2L_CACHE        oauth2l token cache path
+  MAILWAKE_GMAIL_SCOPE          OAuth scope (default: https://mail.google.com/)
+
+Run --setup manually once before using this helper from mailwake/systemd.
+USAGE
+}
+
+setup=false
+case "${1:-}" in
+	--help|-h)
+		usage
+		exit 0
+		;;
+	--setup)
+		setup=true
+		shift
+		;;
+esac
+
+if ! command -v "$OAUTH2L" >/dev/null 2>&1; then
+	echo "gmail-oauth-token: oauth2l command not found" >&2
+	exit 127
+fi
+
+if [ ! -r "$MAILWAKE_GOOGLE_OAUTH_CLIENT" ]; then
+	echo "gmail-oauth-token: OAuth client JSON is not readable" >&2
+	echo "gmail-oauth-token: expected $MAILWAKE_GOOGLE_OAUTH_CLIENT" >&2
+	exit 1
+fi
+
+cache_dir=$(dirname "$MAILWAKE_OAUTH2L_CACHE")
+umask 077
+mkdir -p "$cache_dir"
+chmod 700 "$cache_dir" 2>/dev/null || true
+
+if [ "$setup" = true ]; then
+	exec "$OAUTH2L" fetch \
+		--credentials "$MAILWAKE_GOOGLE_OAUTH_CLIENT" \
+		--cache "$MAILWAKE_OAUTH2L_CACHE" \
+		--scope "$MAILWAKE_GMAIL_SCOPE" \
+		--refresh \
+		"$@"
+fi
+
+token=$("$OAUTH2L" fetch \
+	--credentials "$MAILWAKE_GOOGLE_OAUTH_CLIENT" \
+	--cache "$MAILWAKE_OAUTH2L_CACHE" \
+	--scope "$MAILWAKE_GMAIL_SCOPE" \
+	--refresh \
+	"$@") || {
+	echo "gmail-oauth-token: oauth2l failed to fetch an access token" >&2
+	exit 1
+}
+
+if [ -e "$MAILWAKE_OAUTH2L_CACHE" ]; then
+	chmod 600 "$MAILWAKE_OAUTH2L_CACHE" 2>/dev/null || true
+fi
+
+if [ -z "$token" ]; then
+	echo "gmail-oauth-token: oauth2l returned an empty access token" >&2
+	exit 1
+fi
+
+case "$token" in
+	*[[:space:]]*)
+		echo "gmail-oauth-token: oauth2l output was not a single bare access token" >&2
+		echo "gmail-oauth-token: run with --setup manually, then retry" >&2
+		exit 1
+		;;
+esac
+
+printf '%s\n' "$token"
