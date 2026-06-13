@@ -2,7 +2,8 @@ use crate::config::FsStateSourceConfig;
 use crate::lane::{CommandLifecycle, CommandRunReport, CommandTriggerError, CommandTriggerTarget};
 use crate::process::{ShellProcessError, ShellRun, run_shell_process};
 use crate::state::{RuntimeState, WatcherPhase};
-use notify::{Config as NotifyConfig, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::event::{AccessKind, AccessMode};
+use notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -119,6 +120,7 @@ impl From<ShellProcessError> for StateReadError {
 pub enum FsStateEvent {
     Changed,
     Overflow,
+    Startup,
 }
 
 pub struct FsStateRunner {
@@ -336,9 +338,13 @@ impl FsStateRunner {
                     }
                 }
                 event = events.recv() => {
-                    let event = event?;
-                    self.record_event(event);
-                    return Some(SourceWork::FilesystemEvent(Instant::now()));
+                    match event? {
+                        FsStateEvent::Startup => return Some(SourceWork::StartupTrigger),
+                        event => {
+                            self.record_event(event);
+                            return Some(SourceWork::FilesystemEvent(Instant::now()));
+                        }
+                    }
                 }
             }
         }
@@ -712,7 +718,7 @@ impl FsStateRunner {
             state.mark_event();
         }
         match event {
-            FsStateEvent::Changed => {}
+            FsStateEvent::Changed | FsStateEvent::Startup => {}
             FsStateEvent::Overflow => {
                 warn!(
                     source = %self.source,
@@ -819,6 +825,14 @@ fn spawn_watcher_progress_heartbeat(
     })
 }
 
+fn fs_event_from_notify(kind: EventKind) -> Option<FsStateEvent> {
+    match kind {
+        EventKind::Access(AccessKind::Close(AccessMode::Write)) => Some(FsStateEvent::Changed),
+        EventKind::Access(_) => None,
+        _ => Some(FsStateEvent::Changed),
+    }
+}
+
 fn build_watcher(
     source: &FsStateSourceConfig,
     events: mpsc::Sender<FsStateEvent>,
@@ -826,17 +840,19 @@ fn build_watcher(
     let source_name = source.name.clone();
     let callback_events = events.clone();
     let mut watcher = RecommendedWatcher::new(
-        move |result| {
-            let event = match result {
-                Ok(_) => FsStateEvent::Changed,
+        move |result: notify::Result<notify::Event>| {
+            let Some(event) = (match result {
+                Ok(event) => fs_event_from_notify(event.kind),
                 Err(error) => {
                     warn!(
                         source = %source_name,
                         %error,
                         "filesystem watcher error; treating source as dirty"
                     );
-                    FsStateEvent::Overflow
+                    Some(FsStateEvent::Overflow)
                 }
+            }) else {
+                return;
             };
             match callback_events.try_send(event) {
                 Ok(()) => {}
@@ -1189,6 +1205,32 @@ mod tests {
         .expect("timed out waiting for calls");
     }
 
+    #[test]
+    fn notify_access_open_events_are_ignored() {
+        assert_eq!(
+            fs_event_from_notify(EventKind::Access(AccessKind::Open(AccessMode::Any))),
+            None
+        );
+        assert_eq!(
+            fs_event_from_notify(EventKind::Access(AccessKind::Close(AccessMode::Read))),
+            None
+        );
+    }
+
+    #[test]
+    fn notify_mutating_events_are_treated_as_changes() {
+        assert_eq!(
+            fs_event_from_notify(EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Any
+            ))),
+            Some(FsStateEvent::Changed)
+        );
+        assert_eq!(
+            fs_event_from_notify(EventKind::Access(AccessKind::Close(AccessMode::Write))),
+            Some(FsStateEvent::Changed)
+        );
+    }
+
     #[tokio::test]
     async fn startup_baseline_captures_state_cmd_output() {
         let reader = Arc::new(TestStateReader::new(&["baseline\n"]));
@@ -1286,6 +1328,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queued_startup_event_waits_for_baseline_then_triggers_and_rebaselines() {
+        let reader = Arc::new(TestStateReader::new(&["base", "after"]));
+        let trigger = Arc::new(TestTrigger::new(Duration::ZERO));
+        let (events_tx, events_rx) = mpsc::channel(64);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let runner = FsStateRunner::new_with_settle(
+            "local",
+            Duration::from_millis(5),
+            Duration::from_millis(50),
+            Duration::ZERO,
+            Some(reader.clone() as Arc<dyn StateReader>),
+            trigger.clone(),
+            None,
+        );
+        let handle = tokio::spawn(runner.run(events_rx, shutdown_rx));
+
+        wait_for_calls(&reader.calls, 1).await;
+        assert_eq!(trigger.calls.load(Ordering::SeqCst), 0);
+        events_tx.send(FsStateEvent::Startup).await.unwrap();
+        wait_for_calls(&trigger.calls, 1).await;
+        wait_for_calls(&reader.calls, 2).await;
+        assert_eq!(trigger.calls.load(Ordering::SeqCst), 1);
+
+        let _ = shutdown_tx.send(true);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn run_on_startup_waits_for_baseline_then_triggers_and_rebaselines() {
         let reader = Arc::new(TestStateReader::new(&["base", "after"]));
         let trigger = Arc::new(TestTrigger::new(Duration::ZERO));
@@ -1306,6 +1376,47 @@ mod tests {
 
         wait_for_calls(&reader.calls, 1).await;
         assert_eq!(trigger.calls.load(Ordering::SeqCst), 0);
+        startup_tx.send(true).unwrap();
+        wait_for_calls(&trigger.calls, 1).await;
+        wait_for_calls(&reader.calls, 2).await;
+        assert_eq!(trigger.calls.load(Ordering::SeqCst), 1);
+
+        let _ = shutdown_tx.send(true);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_on_startup_with_initial_ready_triggers_after_readiness() {
+        let reader = Arc::new(TestStateReader::new(&["base", "after"]));
+        let trigger = Arc::new(TestTrigger::new(Duration::ZERO));
+        let (_events_tx, events_rx) = mpsc::channel(64);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let (startup_tx, startup_rx) = watch::channel(false);
+        let _original_startup_rx = startup_rx.clone();
+        let runner = FsStateRunner::new_with_settle(
+            "local",
+            Duration::from_millis(5),
+            Duration::from_millis(50),
+            Duration::ZERO,
+            Some(reader.clone() as Arc<dyn StateReader>),
+            trigger.clone(),
+            None,
+        );
+        let handle = tokio::spawn(runner.run_with_initial_ready(
+            events_rx,
+            shutdown_rx,
+            ready_tx,
+            Some(startup_rx),
+        ));
+
+        let ready = timeout(Duration::from_secs(2), ready_rx)
+            .await
+            .expect("timed out waiting for readiness")
+            .expect("readiness sender dropped");
+        assert!(ready.is_ok());
+        assert_eq!(trigger.calls.load(Ordering::SeqCst), 0);
+        sleep(Duration::from_millis(50)).await;
         startup_tx.send(true).unwrap();
         wait_for_calls(&trigger.calls, 1).await;
         wait_for_calls(&reader.calls, 2).await;

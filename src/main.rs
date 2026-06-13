@@ -501,6 +501,14 @@ async fn run_daemon(
                     Some(Arc::clone(&state)),
                 );
                 let (events_tx, events_rx) = mpsc::channel::<FsStateEvent>(64);
+                if run_on_startup {
+                    task_handles.push(spawn_fs_state_startup_event(
+                        source.name.clone(),
+                        events_tx.clone(),
+                        startup_rx.clone(),
+                        shutdown_rx.clone(),
+                    ));
+                }
                 let initial_ready = if initial_connect_required {
                     let (ready_tx, ready_rx) = oneshot::channel();
                     initial_receivers.push(ready_rx);
@@ -516,7 +524,7 @@ async fn run_daemon(
                     state: Arc::clone(&state),
                     watcher_id,
                     initial_ready,
-                    startup: run_on_startup.then(|| startup_rx.clone()),
+                    startup: None,
                     shutdown: shutdown_rx.clone(),
                 }));
             }
@@ -554,7 +562,11 @@ async fn run_daemon(
         warn!(%error, "failed to send systemd READY notification");
     }
     info!(%ready_status);
-    let _ = startup_tx.send(true);
+    let receiver_count = startup_tx.receiver_count();
+    match startup_tx.send(true) {
+        Ok(()) => info!(receiver_count, "broadcast run_on_startup signal"),
+        Err(error) => warn!(receiver_count, %error, "failed to broadcast run_on_startup signal"),
+    }
 
     tokio::spawn(systemd::run_status_task(
         notifier.clone(),
@@ -642,6 +654,50 @@ fn spawn_startup_event(
                     "source event queue is closed before run_on_startup event"
                 );
             }
+        }
+    })
+}
+
+fn spawn_fs_state_startup_event(
+    source_name: String,
+    events: mpsc::Sender<FsStateEvent>,
+    mut startup: watch::Receiver<bool>,
+    mut shutdown: watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            if *startup.borrow() {
+                break;
+            }
+            tokio::select! {
+                changed = startup.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+                changed = shutdown.changed() => {
+                    if changed.is_ok() && *shutdown.borrow() {
+                        return;
+                    }
+                }
+            }
+        }
+
+        tokio::select! {
+            result = events.send(FsStateEvent::Startup) => {
+                if result.is_ok() {
+                    info!(
+                        source = %source_name,
+                        "queued fs_state run_on_startup event"
+                    );
+                } else {
+                    warn!(
+                        source = %source_name,
+                        "fs_state event queue is closed before run_on_startup event"
+                    );
+                }
+            }
+            _ = shutdown.changed() => {}
         }
     })
 }
@@ -911,6 +967,34 @@ on_notify = "echo sync"
         assert_eq!(command, "echo sync");
         assert_eq!(timeout, Duration::from_secs(30));
         assert_eq!(description, "account=\"gmail\" mailbox=\"INBOX\"");
+    }
+
+    #[tokio::test]
+    async fn fs_state_startup_event_is_queued_after_startup_signal() {
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        let (startup_tx, startup_rx) = watch::channel(false);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = spawn_fs_state_startup_event(
+            "local-state".to_string(),
+            event_tx,
+            startup_rx,
+            shutdown_rx,
+        );
+
+        assert!(
+            timeout(Duration::from_millis(20), event_rx.recv())
+                .await
+                .is_err()
+        );
+        startup_tx.send(true).unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(1), event_rx.recv())
+                .await
+                .expect("timed out waiting for startup event"),
+            Some(FsStateEvent::Startup)
+        );
+        handle.await.unwrap();
+        drop(shutdown_tx);
     }
 
     #[tokio::test]
