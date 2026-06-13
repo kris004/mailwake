@@ -126,6 +126,7 @@ default_max_debounce_seconds = 60
 auth_helper_timeout_seconds = 30
 auth_helper_max_output_bytes = 65536
 command_timeout_seconds = 300
+command_output_max_bytes = 1048576
 connect_timeout_seconds = 30
 imap_operation_timeout_seconds = 60
 idle_refresh_seconds = 1740
@@ -136,8 +137,8 @@ capture_command_output = false
 
 `idle_refresh_seconds` must be at least 60. `watcher_stale_seconds` must be at
 least twice `idle_refresh_seconds`. Auth-helper, command, connect, and IMAP
-operation timeouts must be nonzero. `auth_helper_max_output_bytes` must also be
-nonzero.
+operation timeouts must be nonzero. `auth_helper_max_output_bytes` and
+`command_output_max_bytes` must also be nonzero.
 
 `min_command_interval_seconds` is a post-command cooldown that prevents obvious
 self-trigger loops. If events arrive during the cooldown, they are coalesced and
@@ -171,9 +172,11 @@ observed source event can trigger command execution as soon as cooldown and the
 previous run permit.
 
 `capture_command_output` is normally false. If enabled, `mailwake` captures
-notification command stdout/stderr and logs only byte counts. The old
-`log_command_output` name still parses for compatibility but logs a deprecation
-warning.
+notification command stdout/stderr and logs only byte counts. Captured output is
+capped by `command_output_max_bytes` (default 1 MiB); if a command exceeds the
+cap, `mailwake` kills the command process group and reports a command failure
+without logging the output contents. The old `log_command_output` name still
+parses for compatibility but logs a deprecation warning.
 
 Usernames, mailbox names, and direct LOGIN passwords must not contain CR/LF.
 This prevents unsafe IMAP command construction before anything is sent to the
@@ -205,7 +208,7 @@ name = "local-state"
 type = "fs_state"
 watch_paths = ["/home/alice/.mail/example/.notmuch"]
 recursive = false
-state_cmd = "notmuch count --lastmod"
+state_cmd = "cd /home/alice/.mail/example && notmuch count --lastmod"
 on_change = "local-push"
 debounce_seconds = 5
 max_debounce_seconds = 60
@@ -222,10 +225,17 @@ self-trigger loops when the command itself updates watched state.
 If no `state_cmd` is configured, any settled filesystem event can trigger
 `on_change`.
 
+`state_cmd` runs from the daemon process environment and current working
+directory. Under systemd, that may not match your interactive shell. Prefer
+absolute paths or an explicit `cd` in commands whose result depends on cwd. A
+plain `notmuch count --lastmod` is acceptable only when the service environment
+already points at the intended database, or when the command is independent of
+cwd.
+
 Useful `state_cmd` examples:
 
 ```sh
-notmuch count --lastmod
+cd /home/alice/.mail/example && notmuch count --lastmod
 cat state/version
 sqlite3 app.db 'select max(updated_at) from messages'
 sha256sum important-state-file
@@ -246,7 +256,8 @@ Warnings:
 ```sh
 mailwake --config ~/.config/mailwake/config.toml
 mailwake check-config --config ~/.config/mailwake/config.toml
-mailwake test-command --config ~/.config/mailwake/config.toml --account gmail --mailbox INBOX
+mailwake test-command --config ~/.config/mailwake/config.toml --command local-push
+mailwake test-command --config ~/.config/mailwake/config.toml --account example-imap --mailbox INBOX
 mailwake --no-systemd --config ~/.config/mailwake/config.toml
 mailwake --initial-connect-required --config ~/.config/mailwake/config.toml
 ```
@@ -264,9 +275,11 @@ shell, so a helper that works in a terminal as `gmail-oauth-token` may fail in
 the service unless configured as `/home/alice/.local/bin/gmail-oauth-token`
 or the service explicitly sets a suitable `PATH`.
 
-`test-command` runs the configured command for one account/mailbox, applies the
-configured command timeout, and reports the exit status or timeout outcome. For
-new `imap_idle` sources, it resolves the source's named `on_event` command.
+`test-command --command NAME` runs a named `[[commands]]` entry with its
+configured timeout. The legacy `test-command --account NAME --mailbox NAME`
+form still runs the configured command for one account/mailbox; for top-level
+`imap_idle` sources, it resolves the source's named `on_event` command. Do not
+mix `--command` with `--account`/`--mailbox`.
 
 ## Basic setup
 
@@ -275,7 +288,8 @@ mkdir -p ~/.config/mailwake
 $EDITOR ~/.config/mailwake/config.toml
 
 mailwake check-config --config ~/.config/mailwake/config.toml
-mailwake test-command --config ~/.config/mailwake/config.toml --account gmail --mailbox INBOX
+mailwake test-command --config ~/.config/mailwake/config.toml --command local-push
+mailwake test-command --config ~/.config/mailwake/config.toml --account example-imap --mailbox INBOX
 mailwake --config ~/.config/mailwake/config.toml
 ```
 
@@ -379,7 +393,10 @@ spawning. It does not execute OAuth/password helpers as a separate startup
 preflight; helpers run when IMAP watchers connect and are bounded by
 `auth_helper_timeout_seconds`. With `--initial-connect-required`, readiness waits
 until every watcher completes initial setup before `READY=1` (for IMAP, that
-means one successful login/select/IDLE setup).
+means one successful login/select/IDLE setup; for `fs_state`, it means the
+filesystem watcher was installed and any configured startup `state_cmd` attempt
+completed successfully). If an `fs_state` startup baseline fails while
+`--initial-connect-required` is set, startup fails instead of reporting ready.
 
 Readiness is therefore not the same as "currently connected to Gmail" unless
 `--initial-connect-required` is used. Without that flag, network failures are

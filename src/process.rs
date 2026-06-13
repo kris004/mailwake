@@ -73,7 +73,7 @@ pub async fn run_shell_process(
     capture_stdout: bool,
     capture_stderr: bool,
     command_timeout: Duration,
-    stdout_limit: Option<usize>,
+    output_limit: Option<usize>,
     shutdown: Option<watch::Receiver<bool>>,
 ) -> Result<ShellRun, ShellProcessError> {
     let mut process = Command::new("sh");
@@ -104,12 +104,12 @@ pub async fn run_shell_process(
     let stdout_task = child
         .stdout
         .take()
-        .map(|pipe| read_pipe(pipe, "stdout", stdout_limit, limit_tx.clone()));
+        .map(|pipe| read_pipe(pipe, "stdout", output_limit, limit_tx.clone()));
     let stderr_task = child
         .stderr
         .take()
-        .map(|pipe| read_pipe(pipe, "stderr", None, limit_tx));
-    let mut limit_rx = stdout_limit.map(|_| limit_rx);
+        .map(|pipe| read_pipe(pipe, "stderr", output_limit, limit_tx));
+    let mut limit_rx = output_limit.map(|_| limit_rx);
 
     let mut shutdown = shutdown;
     let end = wait_for_child(

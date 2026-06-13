@@ -8,6 +8,8 @@ use tracing::debug;
 
 use crate::process::{ShellProcessError, ShellRun, run_shell_process};
 
+pub const DEFAULT_COMMAND_OUTPUT_MAX_BYTES: usize = 1_048_576;
+
 pub type CommandRunFuture = Pin<Box<dyn Future<Output = CommandRunResult> + Send>>;
 pub type CommandRunResult = Result<CommandOutcome, CommandError>;
 
@@ -20,14 +22,21 @@ pub struct ShellCommandExecutor {
     command: Arc<str>,
     capture_output: bool,
     timeout: Duration,
+    output_max_bytes: usize,
 }
 
 impl ShellCommandExecutor {
-    pub fn new(command: impl Into<Arc<str>>, capture_output: bool, timeout: Duration) -> Self {
+    pub fn new(
+        command: impl Into<Arc<str>>,
+        capture_output: bool,
+        timeout: Duration,
+        output_max_bytes: usize,
+    ) -> Self {
         Self {
             command: command.into(),
             capture_output,
             timeout,
+            output_max_bytes,
         }
     }
 }
@@ -37,8 +46,16 @@ impl CommandExecutor for ShellCommandExecutor {
         let command = Arc::clone(&self.command);
         let capture_output = self.capture_output;
         let timeout = self.timeout;
+        let output_max_bytes = self.output_max_bytes;
         Box::pin(async move {
-            run_shell_command_with_shutdown(&command, capture_output, timeout, shutdown).await
+            run_shell_command_with_shutdown_and_output_limit(
+                &command,
+                capture_output,
+                timeout,
+                output_max_bytes,
+                shutdown,
+            )
+            .await
         })
     }
 }
@@ -51,6 +68,8 @@ pub struct CommandOutcome {
     pub timed_out: bool,
     pub cancelled: bool,
     pub timeout: Option<Duration>,
+    pub output_limit_exceeded: bool,
+    pub output_limit: Option<usize>,
 }
 
 impl CommandOutcome {
@@ -62,6 +81,8 @@ impl CommandOutcome {
             timed_out: true,
             cancelled: false,
             timeout: Some(timeout),
+            output_limit_exceeded: false,
+            output_limit: None,
         }
     }
 
@@ -73,6 +94,21 @@ impl CommandOutcome {
             timed_out: false,
             cancelled: true,
             timeout: None,
+            output_limit_exceeded: false,
+            output_limit: None,
+        }
+    }
+
+    pub fn output_limit_exceeded(limit: usize) -> Self {
+        Self {
+            success: false,
+            code: None,
+            signal: None,
+            timed_out: false,
+            cancelled: false,
+            timeout: None,
+            output_limit_exceeded: true,
+            output_limit: Some(limit),
         }
     }
 
@@ -83,6 +119,10 @@ impl CommandOutcome {
         }
         if self.cancelled {
             return "cancelled by shutdown".to_string();
+        }
+        if self.output_limit_exceeded {
+            let limit = self.output_limit.unwrap_or_default();
+            return format!("output exceeded {limit} byte limit");
         }
         if let Some(code) = self.code {
             return format!("exit status {code}");
@@ -111,6 +151,8 @@ impl From<std::process::ExitStatus> for CommandOutcome {
             timed_out: false,
             cancelled: false,
             timeout: None,
+            output_limit_exceeded: false,
+            output_limit: None,
         }
     }
 }
@@ -139,7 +181,29 @@ pub async fn run_shell_command(
     capture_output: bool,
     command_timeout: Duration,
 ) -> CommandRunResult {
-    run_shell_command_inner(command, capture_output, command_timeout, None).await
+    run_shell_command_with_output_limit(
+        command,
+        capture_output,
+        command_timeout,
+        DEFAULT_COMMAND_OUTPUT_MAX_BYTES,
+    )
+    .await
+}
+
+pub async fn run_shell_command_with_output_limit(
+    command: &str,
+    capture_output: bool,
+    command_timeout: Duration,
+    output_max_bytes: usize,
+) -> CommandRunResult {
+    run_shell_command_inner(
+        command,
+        capture_output,
+        command_timeout,
+        output_max_bytes,
+        None,
+    )
+    .await
 }
 
 pub async fn run_shell_command_with_shutdown(
@@ -148,21 +212,47 @@ pub async fn run_shell_command_with_shutdown(
     command_timeout: Duration,
     shutdown: watch::Receiver<bool>,
 ) -> CommandRunResult {
-    run_shell_command_inner(command, capture_output, command_timeout, Some(shutdown)).await
+    run_shell_command_with_shutdown_and_output_limit(
+        command,
+        capture_output,
+        command_timeout,
+        DEFAULT_COMMAND_OUTPUT_MAX_BYTES,
+        shutdown,
+    )
+    .await
+}
+
+pub async fn run_shell_command_with_shutdown_and_output_limit(
+    command: &str,
+    capture_output: bool,
+    command_timeout: Duration,
+    output_max_bytes: usize,
+    shutdown: watch::Receiver<bool>,
+) -> CommandRunResult {
+    run_shell_command_inner(
+        command,
+        capture_output,
+        command_timeout,
+        output_max_bytes,
+        Some(shutdown),
+    )
+    .await
 }
 
 async fn run_shell_command_inner(
     command: &str,
     capture_output: bool,
     command_timeout: Duration,
+    output_max_bytes: usize,
     shutdown: Option<watch::Receiver<bool>>,
 ) -> CommandRunResult {
+    let output_limit = capture_output.then_some(output_max_bytes);
     match run_shell_process(
         command,
         capture_output,
         capture_output,
         command_timeout,
-        None,
+        output_limit,
         shutdown,
     )
     .await
@@ -180,8 +270,8 @@ async fn run_shell_command_inner(
         }
         ShellRun::TimedOut => Ok(CommandOutcome::timed_out(command_timeout)),
         ShellRun::Cancelled => Ok(CommandOutcome::cancelled()),
-        ShellRun::OutputLimitExceeded(_) => {
-            unreachable!("notification commands have no output cap")
+        ShellRun::OutputLimitExceeded(exceeded) => {
+            Ok(CommandOutcome::output_limit_exceeded(exceeded.limit))
         }
     }
 }
@@ -237,6 +327,23 @@ mod tests {
         let text = outcome.description();
         assert!(text.contains("timed out"));
         assert!(!text.contains("super-secret"));
+    }
+
+    #[tokio::test]
+    async fn captured_command_output_limit_is_reported_without_output() {
+        let outcome = run_shell_command_with_output_limit(
+            "printf 'super-secret-output'",
+            true,
+            Duration::from_secs(1),
+            8,
+        )
+        .await
+        .expect("output cap should be reported as an outcome");
+        assert!(!outcome.success);
+        assert!(outcome.output_limit_exceeded);
+        let text = outcome.description();
+        assert!(text.contains("output exceeded 8 byte limit"));
+        assert!(!text.contains("super-secret-output"));
     }
 
     #[tokio::test]

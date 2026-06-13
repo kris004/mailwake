@@ -1,3 +1,4 @@
+use crate::command::DEFAULT_COMMAND_OUTPUT_MAX_BYTES;
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::fmt;
@@ -36,6 +37,8 @@ pub struct Config {
     pub auth_helper_max_output_bytes: Option<usize>,
     #[serde(default)]
     pub command_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub command_output_max_bytes: Option<usize>,
     #[serde(default)]
     pub connect_timeout_seconds: Option<u64>,
     #[serde(default)]
@@ -275,6 +278,11 @@ impl Config {
             self.command_timeout_seconds
                 .unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECONDS),
         )?;
+        validate_nonzero_bytes(
+            "command_output_max_bytes",
+            self.command_output_max_bytes
+                .unwrap_or(DEFAULT_COMMAND_OUTPUT_MAX_BYTES),
+        )?;
         validate_nonzero_seconds(
             "connect_timeout_seconds",
             self.connect_timeout_seconds
@@ -434,6 +442,11 @@ impl Config {
             self.command_timeout_seconds
                 .unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECONDS),
         )
+    }
+
+    pub fn command_output_max_bytes(&self) -> usize {
+        self.command_output_max_bytes
+            .unwrap_or(DEFAULT_COMMAND_OUTPUT_MAX_BYTES)
     }
 
     pub fn connect_timeout(&self) -> Duration {
@@ -825,6 +838,7 @@ debounce_seconds = 10
         assert_eq!(config.auth_helper_timeout().as_secs(), 30);
         assert_eq!(config.auth_helper_max_output_bytes(), 65_536);
         assert_eq!(config.command_timeout().as_secs(), 300);
+        assert_eq!(config.command_output_max_bytes(), 1_048_576);
         assert_eq!(config.connect_timeout().as_secs(), 30);
         assert_eq!(config.imap_operation_timeout().as_secs(), 60);
         assert_eq!(config.min_command_interval().as_secs(), 60);
@@ -914,6 +928,7 @@ password = 123
             ("auth_helper_timeout_seconds", "0"),
             ("auth_helper_max_output_bytes", "0"),
             ("command_timeout_seconds", "0"),
+            ("command_output_max_bytes", "0"),
             ("connect_timeout_seconds", "0"),
             ("imap_operation_timeout_seconds", "0"),
             ("idle_refresh_seconds", "0"),

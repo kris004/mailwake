@@ -1,5 +1,6 @@
 /target/
 /*.zip
+_review/
 config.toml
 *.local.toml
 examples/*.local.toml

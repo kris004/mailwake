@@ -146,6 +146,27 @@ impl RuntimeState {
         entry.last_progress = Instant::now();
     }
 
+    pub fn mark_watcher_progress(&self, id: &str) {
+        let mut inner = self.inner.lock().expect("runtime state mutex poisoned");
+        let Some(entry) = inner.watchers.get_mut(id) else {
+            return;
+        };
+        if matches!(entry.phase, WatcherPhase::Crashed | WatcherPhase::Stopped) {
+            return;
+        }
+        entry.last_progress = Instant::now();
+    }
+
+    pub fn watcher_heartbeat_interval(&self) -> Duration {
+        let half_stale = self.watcher_stale / 2;
+        let interval = if half_stale.is_zero() {
+            Duration::from_millis(1)
+        } else {
+            half_stale
+        };
+        std::cmp::min(interval, Duration::from_secs(60))
+    }
+
     pub fn mark_command_runner(&self, id: &str, phase: CommandRunnerPhase) {
         let mut inner = self.inner.lock().expect("runtime state mutex poisoned");
         let entry = inner
@@ -325,5 +346,33 @@ mod tests {
         state.mark_command_started("gmail/INBOX");
         tokio::time::sleep(Duration::from_millis(80)).await;
         assert!(!state.is_healthy());
+    }
+
+    #[tokio::test]
+    async fn watcher_progress_refresh_keeps_idle_watcher_healthy() {
+        let state = RuntimeState::new(1, 1, 1, Duration::from_millis(40), Duration::from_secs(1));
+        state.register_watcher("local-state");
+        state.register_command_runner("sync");
+        state.mark_watcher("local-state", WatcherPhase::Idling);
+        state.mark_command_runner("sync", CommandRunnerPhase::Idle);
+        assert!(state.is_healthy());
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(!state.is_healthy());
+
+        state.mark_watcher_progress("local-state");
+        assert!(state.is_healthy());
+    }
+
+    #[test]
+    fn watcher_heartbeat_interval_is_bounded_by_stale_threshold() {
+        let short = RuntimeState::new(0, 0, 0, Duration::from_millis(40), Duration::from_secs(1));
+        assert_eq!(
+            short.watcher_heartbeat_interval(),
+            Duration::from_millis(20)
+        );
+
+        let long = RuntimeState::new(0, 0, 0, Duration::from_secs(1000), Duration::from_secs(1));
+        assert_eq!(long.watcher_heartbeat_interval(), Duration::from_secs(60));
     }
 }

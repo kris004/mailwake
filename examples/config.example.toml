@@ -5,6 +5,7 @@
 default_debounce_seconds = 10
 default_max_debounce_seconds = 60
 command_timeout_seconds = 300
+command_output_max_bytes = 1048576
 min_command_interval_seconds = 60
 
 [[commands]]
@@ -42,7 +43,7 @@ name = "local-state"
 type = "fs_state"
 watch_paths = ["/home/alice/.mail/example/.notmuch"]
 recursive = false
-state_cmd = "notmuch count --lastmod"
+state_cmd = "cd /home/alice/.mail/example && notmuch count --lastmod"
 on_change = "local-push"
 debounce_seconds = 5
 max_debounce_seconds = 60

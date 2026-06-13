@@ -442,6 +442,8 @@ mod tests {
             timed_out: false,
             cancelled: false,
             timeout: None,
+            output_limit_exceeded: false,
+            output_limit: None,
         }
     }
 

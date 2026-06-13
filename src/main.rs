@@ -1,10 +1,12 @@
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{ArgGroup, Parser, Subcommand};
 use mailwake::auth;
-use mailwake::command::{ShellCommandExecutor, run_shell_command};
+use mailwake::command::{ShellCommandExecutor, run_shell_command_with_output_limit};
 use mailwake::config::{Config, MailboxConfig, SourceConfig, legacy_source_name};
 use mailwake::debounce::DebounceRunner;
-use mailwake::fs_state::{FsStateEvent, FsStateRunner, ShellStateReader, StateReader};
+use mailwake::fs_state::{
+    FsStateEvent, FsStateRunner, FsStateWatcherTask, ShellStateReader, StateReader,
+};
 use mailwake::imap;
 use mailwake::lane::{
     CommandLaneRunner, CommandRequest, CommandTrigger, CommandTriggerTarget, LaneCommand,
@@ -53,12 +55,26 @@ enum Commands {
         about = "Parse and validate config without connecting"
     )]
     CheckConfig,
-    #[command(name = "test-command", about = "Run one configured mailbox command")]
+    #[command(
+        name = "test-command",
+        about = "Run one configured command",
+        group(
+            ArgGroup::new("target")
+                .required(true)
+                .args(["command", "account"])
+        )
+    )]
     TestCommand {
-        #[arg(long)]
-        account: String,
-        #[arg(long)]
-        mailbox: String,
+        #[arg(
+            long,
+            value_name = "NAME",
+            conflicts_with_all = ["account", "mailbox"]
+        )]
+        command: Option<String>,
+        #[arg(long, requires = "mailbox")]
+        account: Option<String>,
+        #[arg(long, requires = "account")]
+        mailbox: Option<String>,
     },
 }
 
@@ -80,8 +96,18 @@ async fn run(cli: Cli) -> Result<()> {
     let config_path = resolve_config_path(cli.config.as_deref());
     match cli.command {
         Some(Commands::CheckConfig) => check_config(&config_path),
-        Some(Commands::TestCommand { account, mailbox }) => {
-            test_command(&config_path, &account, &mailbox).await
+        Some(Commands::TestCommand {
+            command,
+            account,
+            mailbox,
+        }) => {
+            test_command(
+                &config_path,
+                command.as_deref(),
+                account.as_deref(),
+                mailbox.as_deref(),
+            )
+            .await
         }
         None => run_daemon(&config_path, !cli.no_systemd, cli.initial_connect_required).await,
     }
@@ -102,19 +128,62 @@ fn check_config(path: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn test_command(path: &Path, account_name: &str, mailbox_name: &str) -> Result<()> {
+async fn test_command(
+    path: &Path,
+    command_name: Option<&str>,
+    account_name: Option<&str>,
+    mailbox_name: Option<&str>,
+) -> Result<()> {
     let config =
         Config::load(path).with_context(|| format!("failed to load {}", path.display()))?;
     config.warn_for_insecure_options();
-    let (command, timeout) = mailbox_command(&config, account_name, mailbox_name)?;
+    let (command, timeout, description) =
+        configured_test_command(&config, command_name, account_name, mailbox_name)?;
 
-    println!("running configured command for account={account_name:?} mailbox={mailbox_name:?}");
-    let outcome = run_shell_command(command, config.capture_command_output(), timeout).await?;
+    println!("running configured command for {description}");
+    let outcome = run_shell_command_with_output_limit(
+        command,
+        config.capture_command_output(),
+        timeout,
+        config.command_output_max_bytes(),
+    )
+    .await?;
     println!("command finished with {}", outcome.description());
     if !outcome.success {
         bail!("configured command failed with {}", outcome.description());
     }
     Ok(())
+}
+
+fn configured_test_command<'a>(
+    config: &'a Config,
+    command_name: Option<&str>,
+    account_name: Option<&str>,
+    mailbox_name: Option<&str>,
+) -> Result<(&'a str, Duration, String)> {
+    match (command_name, account_name, mailbox_name) {
+        (Some(name), None, None) => {
+            let command = config
+                .commands
+                .iter()
+                .find(|command| command.name == name)
+                .with_context(|| format!("command {name:?} not found"))?;
+            Ok((
+                &command.cmd,
+                command.timeout(config),
+                format!("command={name:?}"),
+            ))
+        }
+        (None, Some(account), Some(mailbox)) => {
+            let (command, timeout) = mailbox_command(config, account, mailbox)?;
+            Ok((
+                command,
+                timeout,
+                format!("account={account:?} mailbox={mailbox:?}"),
+            ))
+        }
+        _ => bail!("specify either --command or both --account and --mailbox"),
+    }
 }
 
 fn mailbox_command<'a>(
@@ -249,7 +318,7 @@ async fn run_daemon(
     ));
     let notifier = Notifier::from_env(systemd_enabled);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let mut initial_receivers = Vec::new();
+    let mut initial_receivers: Vec<oneshot::Receiver<Result<(), String>>> = Vec::new();
     let mut task_handles = Vec::new();
     let mut command_senders = HashMap::new();
 
@@ -267,6 +336,7 @@ async fn run_daemon(
                     Arc::<str>::from(command.cmd),
                     config.capture_command_output(),
                     command.timeout,
+                    config.command_output_max_bytes(),
                 )),
                 min_interval: command.min_interval,
             })
@@ -310,24 +380,29 @@ async fn run_daemon(
                 shutdown_rx.clone(),
             ));
 
-            let (ready_tx, ready_rx) = oneshot::channel();
-            initial_receivers.push(ready_rx);
-            task_handles.push(spawn_watcher(
-                account.clone(),
+            let initial_ready = if initial_connect_required {
+                let (ready_tx, ready_rx) = oneshot::channel();
+                initial_receivers.push(ready_rx);
+                Some(ready_tx)
+            } else {
+                None
+            };
+            task_handles.push(spawn_watcher(ImapWatcherTask {
+                account: account.clone(),
                 mailbox,
                 event_tx,
-                Arc::clone(&state),
+                state: Arc::clone(&state),
                 watcher_id,
-                Some(ready_tx),
-                shutdown_rx.clone(),
-                mailwake::imap::WatcherSettings {
+                initial_ready,
+                shutdown: shutdown_rx.clone(),
+                settings: mailwake::imap::WatcherSettings {
                     idle_refresh: config.idle_refresh(),
                     auth_helper_timeout: config.auth_helper_timeout(),
                     auth_helper_max_output_bytes: config.auth_helper_max_output_bytes(),
                     connect_timeout: config.connect_timeout(),
                     operation_timeout: config.imap_operation_timeout(),
                 },
-            ));
+            }));
         }
     }
 
@@ -367,29 +442,34 @@ async fn run_daemon(
                     shutdown_rx.clone(),
                 ));
 
-                let (ready_tx, ready_rx) = oneshot::channel();
-                initial_receivers.push(ready_rx);
+                let initial_ready = if initial_connect_required {
+                    let (ready_tx, ready_rx) = oneshot::channel();
+                    initial_receivers.push(ready_rx);
+                    Some(ready_tx)
+                } else {
+                    None
+                };
                 let mailbox = MailboxConfig {
                     name: source.mailbox.clone(),
                     on_notify: String::new(),
                     debounce_seconds: source.debounce_seconds,
                 };
-                task_handles.push(spawn_watcher(
+                task_handles.push(spawn_watcher(ImapWatcherTask {
                     account,
                     mailbox,
                     event_tx,
-                    Arc::clone(&state),
+                    state: Arc::clone(&state),
                     watcher_id,
-                    Some(ready_tx),
-                    shutdown_rx.clone(),
-                    mailwake::imap::WatcherSettings {
+                    initial_ready,
+                    shutdown: shutdown_rx.clone(),
+                    settings: mailwake::imap::WatcherSettings {
                         idle_refresh: config.idle_refresh(),
                         auth_helper_timeout: config.auth_helper_timeout(),
                         auth_helper_max_output_bytes: config.auth_helper_max_output_bytes(),
                         connect_timeout: config.connect_timeout(),
                         operation_timeout: config.imap_operation_timeout(),
                     },
-                ));
+                }));
             }
             SourceConfig::FsState(source) => {
                 let watcher_id = source.name.clone();
@@ -411,18 +491,23 @@ async fn run_daemon(
                     Some(Arc::clone(&state)),
                 );
                 let (events_tx, events_rx) = mpsc::channel::<FsStateEvent>(64);
-                let (ready_tx, ready_rx) = oneshot::channel();
-                initial_receivers.push(ready_rx);
-                task_handles.push(spawn_fs_state_watcher(
+                let initial_ready = if initial_connect_required {
+                    let (ready_tx, ready_rx) = oneshot::channel();
+                    initial_receivers.push(ready_rx);
+                    Some(ready_tx)
+                } else {
+                    None
+                };
+                task_handles.push(spawn_fs_state_watcher(FsStateWatcherTask {
                     source,
                     runner,
                     events_tx,
                     events_rx,
-                    Arc::clone(&state),
+                    state: Arc::clone(&state),
                     watcher_id,
-                    Some(ready_tx),
-                    shutdown_rx.clone(),
-                ));
+                    initial_ready,
+                    shutdown: shutdown_rx.clone(),
+                }));
             }
         }
     }
@@ -431,7 +516,10 @@ async fn run_daemon(
         info!("waiting for initial watcher setup");
         for ready in initial_receivers {
             tokio::select! {
-                result = ready => result.context("watcher stopped before initial setup completed")?,
+                result = ready => match result.context("watcher stopped before initial setup completed")? {
+                    Ok(()) => {}
+                    Err(error) => bail!("initial watcher setup failed: {error}"),
+                },
                 _ = wait_for_shutdown_signal() => {
                     let _ = shutdown_tx.send(true);
                     let _ = notifier.stopping();
@@ -520,32 +608,12 @@ fn spawn_lane_runner(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn spawn_fs_state_watcher(
-    source: mailwake::config::FsStateSourceConfig,
-    runner: FsStateRunner,
-    events_tx: mpsc::Sender<FsStateEvent>,
-    events_rx: mpsc::Receiver<FsStateEvent>,
-    state: Arc<RuntimeState>,
-    watcher_id: String,
-    initial_ready: Option<oneshot::Sender<()>>,
-    shutdown: watch::Receiver<bool>,
-) -> JoinHandle<()> {
-    let state_for_task = Arc::clone(&state);
-    let watcher_id_for_task = watcher_id.clone();
-    let source_name = source.name.clone();
+fn spawn_fs_state_watcher(task: FsStateWatcherTask) -> JoinHandle<()> {
+    let state = Arc::clone(&task.state);
+    let watcher_id = task.watcher_id.clone();
+    let source_name = task.source.name.clone();
     let handle = tokio::spawn(async move {
-        mailwake::fs_state::watch_fs_state_forever(
-            source,
-            runner,
-            events_tx,
-            events_rx,
-            state_for_task,
-            watcher_id_for_task,
-            initial_ready,
-            shutdown,
-        )
-        .await;
+        mailwake::fs_state::watch_fs_state_forever(task).await;
     });
 
     tokio::spawn(async move {
@@ -560,29 +628,31 @@ fn spawn_fs_state_watcher(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn spawn_watcher(
+struct ImapWatcherTask {
     account: mailwake::config::AccountConfig,
     mailbox: mailwake::config::MailboxConfig,
     event_tx: mpsc::Sender<()>,
     state: Arc<RuntimeState>,
     watcher_id: String,
-    initial_ready: Option<oneshot::Sender<()>>,
+    initial_ready: Option<oneshot::Sender<Result<(), String>>>,
     shutdown: watch::Receiver<bool>,
     settings: mailwake::imap::WatcherSettings,
-) -> JoinHandle<()> {
-    let state_for_task = Arc::clone(&state);
-    let account_name = account.name.clone();
-    let mailbox_name = mailbox.name.clone();
+}
+
+fn spawn_watcher(task: ImapWatcherTask) -> JoinHandle<()> {
+    let state = Arc::clone(&task.state);
+    let watcher_id = task.watcher_id.clone();
+    let account_name = task.account.name.clone();
+    let mailbox_name = task.mailbox.name.clone();
     let handle = tokio::spawn(async move {
         imap::watch_mailbox_forever(
-            account,
-            mailbox,
-            event_tx,
-            state_for_task,
-            initial_ready,
-            shutdown,
-            settings,
+            task.account,
+            task.mailbox,
+            task.event_tx,
+            task.state,
+            task.initial_ready,
+            task.shutdown,
+            task.settings,
         )
         .await;
     });
@@ -658,4 +728,127 @@ fn expand_tilde(path: &Path) -> PathBuf {
         return PathBuf::from(home).join(rest);
     }
     path.to_path_buf()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_command_accepts_named_command() {
+        let cli = Cli::try_parse_from(["mailwake", "test-command", "--command", "local-push"])
+            .expect("named command invocation should parse");
+        let Some(Commands::TestCommand {
+            command,
+            account,
+            mailbox,
+        }) = cli.command
+        else {
+            panic!("expected test-command");
+        };
+        assert_eq!(command.as_deref(), Some("local-push"));
+        assert!(account.is_none());
+        assert!(mailbox.is_none());
+    }
+
+    #[test]
+    fn test_command_keeps_legacy_account_mailbox_invocation() {
+        let cli = Cli::try_parse_from([
+            "mailwake",
+            "test-command",
+            "--account",
+            "gmail",
+            "--mailbox",
+            "INBOX",
+        ])
+        .expect("legacy invocation should parse");
+        let Some(Commands::TestCommand {
+            command,
+            account,
+            mailbox,
+        }) = cli.command
+        else {
+            panic!("expected test-command");
+        };
+        assert!(command.is_none());
+        assert_eq!(account.as_deref(), Some("gmail"));
+        assert_eq!(mailbox.as_deref(), Some("INBOX"));
+    }
+
+    #[test]
+    fn test_command_rejects_ambiguous_invocation() {
+        let result = Cli::try_parse_from([
+            "mailwake",
+            "test-command",
+            "--command",
+            "local-push",
+            "--account",
+            "gmail",
+            "--mailbox",
+            "INBOX",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_command_requires_complete_legacy_target() {
+        assert!(Cli::try_parse_from(["mailwake", "test-command", "--account", "gmail"]).is_err());
+        assert!(Cli::try_parse_from(["mailwake", "test-command", "--mailbox", "INBOX"]).is_err());
+    }
+
+    #[test]
+    fn configured_test_command_finds_named_command() {
+        let config = Config::parse_str(
+            r#"
+command_timeout_seconds = 30
+
+[[commands]]
+name = "local-push"
+cmd = "echo push"
+timeout_seconds = 7
+
+[[sources]]
+name = "local-state"
+type = "fs_state"
+watch_paths = ["/tmp/mailwake-example-state"]
+on_change = "local-push"
+"#,
+        )
+        .expect("config should parse");
+
+        let (command, timeout, description) =
+            configured_test_command(&config, Some("local-push"), None, None)
+                .expect("command should be found");
+        assert_eq!(command, "echo push");
+        assert_eq!(timeout, Duration::from_secs(7));
+        assert_eq!(description, "command=\"local-push\"");
+    }
+
+    #[test]
+    fn configured_test_command_keeps_legacy_account_mailbox_lookup() {
+        let config = Config::parse_str(
+            r#"
+command_timeout_seconds = 30
+
+[[accounts]]
+name = "gmail"
+host = "imap.gmail.com"
+username = "user@example.com"
+auth = "xoauth2_cmd"
+xoauth2_cmd = "gmail-oauth-token"
+
+[[accounts.mailboxes]]
+name = "INBOX"
+on_notify = "echo sync"
+"#,
+        )
+        .expect("config should parse");
+
+        let (command, timeout, description) =
+            configured_test_command(&config, None, Some("gmail"), Some("INBOX"))
+                .expect("legacy command should be found");
+        assert_eq!(command, "echo sync");
+        assert_eq!(timeout, Duration::from_secs(30));
+        assert_eq!(description, "account=\"gmail\" mailbox=\"INBOX\"");
+    }
 }

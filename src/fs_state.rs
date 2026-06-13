@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep, sleep_until};
 use tracing::{debug, error, info, warn};
 
@@ -175,6 +176,25 @@ impl FsStateRunner {
         mut events: mpsc::Receiver<FsStateEvent>,
         mut shutdown: watch::Receiver<bool>,
     ) {
+        self.run_inner(&mut events, &mut shutdown, None).await;
+    }
+
+    pub async fn run_with_initial_ready(
+        self,
+        mut events: mpsc::Receiver<FsStateEvent>,
+        mut shutdown: watch::Receiver<bool>,
+        initial_ready: oneshot::Sender<Result<(), String>>,
+    ) {
+        self.run_inner(&mut events, &mut shutdown, Some(initial_ready))
+            .await;
+    }
+
+    async fn run_inner(
+        self,
+        events: &mut mpsc::Receiver<FsStateEvent>,
+        shutdown: &mut watch::Receiver<bool>,
+        initial_ready: Option<oneshot::Sender<Result<(), String>>>,
+    ) {
         let mut baseline = match &self.state_reader {
             Some(reader) => match reader.read(shutdown.clone()).await {
                 Ok(state) => {
@@ -183,30 +203,42 @@ impl FsStateRunner {
                         state_bytes = state.len(),
                         "captured fs_state startup baseline"
                     );
-                    Some(state)
+                    send_initial_ready(initial_ready, Ok(()));
+                    Some(Baseline::Known(state))
                 }
                 Err(StateReadError::Cancelled) => return,
                 Err(error) => {
+                    let error_text = error.to_string();
                     warn!(
                         source = %self.source,
                         %error,
                         "failed to capture fs_state startup baseline; will retry on change"
                     );
-                    None
+                    if let Some(sender) = initial_ready {
+                        let _ = sender.send(Err(format!(
+                            "fs_state source {:?} startup baseline failed: {error_text}",
+                            self.source
+                        )));
+                        return;
+                    }
+                    Some(Baseline::Unknown)
                 }
             },
-            None => None,
+            None => {
+                send_initial_ready(initial_ready, Ok(()));
+                None
+            }
         };
 
         loop {
-            let Some(first_event_at) = self.recv_event(&mut events, &mut shutdown).await else {
+            let Some(first_event_at) = self.recv_event(events, shutdown).await else {
                 break;
             };
             let mut batch = EventBatch::new(first_event_at);
 
             loop {
                 match self
-                    .wait_for_settled_batch(&mut events, &mut shutdown, &mut batch)
+                    .wait_for_settled_batch(events, shutdown, &mut batch)
                     .await
                 {
                     BatchWait::CheckNow => {}
@@ -214,7 +246,7 @@ impl FsStateRunner {
                 }
 
                 match self
-                    .process_dirty_batch(&mut baseline, &mut events, &mut shutdown)
+                    .process_dirty_batch(&mut baseline, events, shutdown)
                     .await
                 {
                     OperationResult::Shutdown => return,
@@ -283,7 +315,7 @@ impl FsStateRunner {
 
     async fn process_dirty_batch(
         &self,
-        baseline: &mut Option<String>,
+        baseline: &mut Option<Baseline>,
         events: &mut mpsc::Receiver<FsStateEvent>,
         shutdown: &mut watch::Receiver<bool>,
     ) -> OperationResult {
@@ -298,19 +330,20 @@ impl FsStateRunner {
                     ReadOperation::Failed { dirty } => return dirty.into_operation_result(),
                 };
 
-                if let Some(previous) = baseline.as_ref() {
-                    if previous == &state {
+                match baseline.as_ref() {
+                    Some(Baseline::Known(previous)) if previous == &state => {
                         return dirty.into_operation_result();
                     }
-                    true
-                } else {
-                    debug!(
-                        source = %self.source,
-                        state_bytes = state.len(),
-                        "captured fs_state baseline after prior state_cmd failure"
-                    );
-                    *baseline = Some(state);
-                    return dirty.into_operation_result();
+                    Some(Baseline::Known(_)) => true,
+                    Some(Baseline::Unknown) => {
+                        debug!(
+                            source = %self.source,
+                            state_bytes = state.len(),
+                            "fs_state baseline is unknown; triggering once before rebaseline"
+                        );
+                        true
+                    }
+                    None => true,
                 }
             }
             None => true,
@@ -321,9 +354,19 @@ impl FsStateRunner {
         }
 
         let dirty = match self.trigger_collecting_events(events, shutdown).await {
-            TriggerOperation::Finished { dirty } => dirty,
+            TriggerOperation::Finished { report, mut dirty } => {
+                if report.success() {
+                    dirty
+                } else {
+                    dirty.note_now();
+                    return dirty.into_operation_result();
+                }
+            }
             TriggerOperation::Shutdown => return OperationResult::Shutdown,
-            TriggerOperation::Failed { dirty } => return dirty.into_operation_result(),
+            TriggerOperation::Failed { mut dirty } => {
+                dirty.note_now();
+                return dirty.into_operation_result();
+            }
         };
 
         if !self
@@ -344,7 +387,7 @@ impl FsStateRunner {
                         state_bytes = state.len(),
                         "rebaselined fs_state after command"
                     );
-                    *baseline = Some(state);
+                    *baseline = Some(Baseline::Known(state));
                 }
                 ReadOperation::Failed { .. } => {
                     warn!(
@@ -463,14 +506,14 @@ impl FsStateRunner {
                             own_command_running = true;
                         }
                         Some(CommandLifecycle::Finished(report)) => {
-                            if matches!(report, CommandRunReport::Error(_) | CommandRunReport::Cancelled) {
+                            if !report.success() {
                                 warn!(
                                     source = %self.source,
                                     status = %report.description(),
                                     "fs_state command did not complete successfully"
                                 );
                             }
-                            return TriggerOperation::Finished { dirty };
+                            return TriggerOperation::Finished { report, dirty };
                         }
                         None => {
                             warn!(
@@ -560,35 +603,64 @@ impl FsStateRunner {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn watch_fs_state_forever(
-    source: FsStateSourceConfig,
-    runner: FsStateRunner,
-    events_tx: mpsc::Sender<FsStateEvent>,
-    events_rx: mpsc::Receiver<FsStateEvent>,
-    state: Arc<RuntimeState>,
-    watcher_id: String,
-    initial_ready: Option<oneshot::Sender<()>>,
-    shutdown: watch::Receiver<bool>,
-) {
+pub struct FsStateWatcherTask {
+    pub source: FsStateSourceConfig,
+    pub runner: FsStateRunner,
+    pub events_tx: mpsc::Sender<FsStateEvent>,
+    pub events_rx: mpsc::Receiver<FsStateEvent>,
+    pub state: Arc<RuntimeState>,
+    pub watcher_id: String,
+    pub initial_ready: Option<oneshot::Sender<Result<(), String>>>,
+    pub shutdown: watch::Receiver<bool>,
+}
+
+pub async fn watch_fs_state_forever(task: FsStateWatcherTask) {
+    let FsStateWatcherTask {
+        source,
+        runner,
+        events_tx,
+        events_rx,
+        state,
+        watcher_id,
+        initial_ready,
+        shutdown,
+    } = task;
+
     state.mark_watcher(&watcher_id, WatcherPhase::Connecting);
     match build_watcher(&source, events_tx) {
         Ok(_watcher) => {
             state.mark_watcher(&watcher_id, WatcherPhase::Idling);
-            if let Some(sender) = initial_ready {
-                let _ = sender.send(());
-            }
+            let heartbeat = spawn_watcher_progress_heartbeat(
+                Arc::clone(&state),
+                watcher_id.clone(),
+                shutdown.clone(),
+            );
             info!(
                 source = %source.name,
                 paths = source.watch_paths.len(),
                 recursive = source.recursive(),
                 "fs_state watcher started"
             );
-            runner.run(events_rx, shutdown).await;
+            if let Some(sender) = initial_ready {
+                runner
+                    .run_with_initial_ready(events_rx, shutdown, sender)
+                    .await;
+            } else {
+                runner.run(events_rx, shutdown).await;
+            }
+            heartbeat.abort();
+            let _ = heartbeat.await;
             state.mark_watcher(&watcher_id, WatcherPhase::Stopped);
             info!(source = %source.name, "fs_state watcher stopped");
         }
         Err(error) => {
+            let error_text = error.to_string();
+            if let Some(sender) = initial_ready {
+                let _ = sender.send(Err(format!(
+                    "fs_state source {:?} watcher setup failed: {error_text}",
+                    source.name
+                )));
+            }
             state.mark_watcher(&watcher_id, WatcherPhase::Crashed);
             error!(
                 source = %source.name,
@@ -597,6 +669,28 @@ pub async fn watch_fs_state_forever(
             );
         }
     }
+}
+
+fn spawn_watcher_progress_heartbeat(
+    state: Arc<RuntimeState>,
+    watcher_id: String,
+    mut shutdown: watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    let interval = state.watcher_heartbeat_interval();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                () = sleep(interval) => {
+                    state.mark_watcher_progress(&watcher_id);
+                }
+                changed = shutdown.changed() => {
+                    if changed.is_ok() && *shutdown.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+    })
 }
 
 fn build_watcher(
@@ -700,8 +794,13 @@ enum ReadOperation {
 }
 
 enum TriggerOperation {
-    Finished { dirty: DirtyTracker },
-    Failed { dirty: DirtyTracker },
+    Finished {
+        report: CommandRunReport,
+        dirty: DirtyTracker,
+    },
+    Failed {
+        dirty: DirtyTracker,
+    },
     Shutdown,
 }
 
@@ -709,6 +808,20 @@ enum OperationResult {
     Idle,
     DirtyAgain(DirtyTracker),
     Shutdown,
+}
+
+enum Baseline {
+    Known(String),
+    Unknown,
+}
+
+fn send_initial_ready(
+    sender: Option<oneshot::Sender<Result<(), String>>>,
+    result: Result<(), String>,
+) {
+    if let Some(sender) = sender {
+        let _ = sender.send(result);
+    }
 }
 
 fn trim_trailing_crlf(value: &str) -> &str {
@@ -744,6 +857,7 @@ mod tests {
         states: Arc<Mutex<VecDeque<String>>>,
         last: Arc<Mutex<String>>,
         delay: Duration,
+        failures_remaining: Arc<AtomicUsize>,
     }
 
     impl TestStateReader {
@@ -751,7 +865,15 @@ mod tests {
             Self::new_with_delay(states, Duration::ZERO)
         }
 
+        fn new_with_failures(states: &[&str], failures: usize) -> Self {
+            Self::new_with_delay_and_failures(states, Duration::ZERO, failures)
+        }
+
         fn new_with_delay(states: &[&str], delay: Duration) -> Self {
+            Self::new_with_delay_and_failures(states, delay, 0)
+        }
+
+        fn new_with_delay_and_failures(states: &[&str], delay: Duration, failures: usize) -> Self {
             let last = states.last().copied().unwrap_or_default().to_string();
             Self {
                 calls: Arc::new(AtomicUsize::new(0)),
@@ -760,6 +882,7 @@ mod tests {
                 )),
                 last: Arc::new(Mutex::new(last)),
                 delay,
+                failures_remaining: Arc::new(AtomicUsize::new(failures)),
             }
         }
     }
@@ -771,6 +894,22 @@ mod tests {
                 this.calls.fetch_add(1, Ordering::SeqCst);
                 if !this.delay.is_zero() {
                     sleep(this.delay).await;
+                }
+                let mut remaining = this.failures_remaining.load(Ordering::SeqCst);
+                while remaining > 0 {
+                    match this.failures_remaining.compare_exchange(
+                        remaining,
+                        remaining - 1,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    ) {
+                        Ok(_) => {
+                            return Err(StateReadError::Failed {
+                                status: "test failure".to_string(),
+                            });
+                        }
+                        Err(actual) => remaining = actual,
+                    }
                 }
                 let mut states = this.states.lock().unwrap();
                 let state = states.pop_front().unwrap_or_else(|| {
@@ -787,6 +926,7 @@ mod tests {
         calls: Arc<AtomicUsize>,
         delay: Duration,
         event_during_run: Option<mpsc::Sender<FsStateEvent>>,
+        result: TestTriggerResult,
     }
 
     impl TestTrigger {
@@ -795,14 +935,36 @@ mod tests {
                 calls: Arc::new(AtomicUsize::new(0)),
                 delay,
                 event_during_run: None,
+                result: TestTriggerResult::Success,
             }
         }
+
+        fn with_result(result: TestTriggerResult) -> Self {
+            Self {
+                calls: Arc::new(AtomicUsize::new(0)),
+                delay: Duration::ZERO,
+                event_during_run: None,
+                result,
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum TestTriggerResult {
+        Success,
+        ExitFailure,
+        TimedOut,
+        Cancelled,
+        SubmitFailure,
     }
 
     impl CommandTriggerTarget for TestTrigger {
         fn start(&self) -> crate::lane::CommandTriggerStartFuture {
             let this = self.clone();
             Box::pin(async move {
+                if matches!(this.result, TestTriggerResult::SubmitFailure) {
+                    return Err(CommandTriggerError::LaneStopped);
+                }
                 let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
                 tokio::spawn(async move {
                     this.calls.fetch_add(1, Ordering::SeqCst);
@@ -813,9 +975,20 @@ mod tests {
                     if !this.delay.is_zero() {
                         sleep(this.delay).await;
                     }
-                    let _ = lifecycle_tx.send(CommandLifecycle::Finished(
-                        CommandRunReport::Outcome(CommandOutcome::success()),
-                    ));
+                    let report = match this.result {
+                        TestTriggerResult::Success => {
+                            CommandRunReport::Outcome(CommandOutcome::success())
+                        }
+                        TestTriggerResult::ExitFailure => {
+                            CommandRunReport::Outcome(CommandOutcome::failure())
+                        }
+                        TestTriggerResult::TimedOut => CommandRunReport::Outcome(
+                            CommandOutcome::timed_out(Duration::from_secs(1)),
+                        ),
+                        TestTriggerResult::Cancelled => CommandRunReport::Cancelled,
+                        TestTriggerResult::SubmitFailure => unreachable!(),
+                    };
+                    let _ = lifecycle_tx.send(CommandLifecycle::Finished(report));
                 });
                 Ok(lifecycle_rx)
             })
@@ -831,6 +1004,21 @@ mod tests {
                 timed_out: false,
                 cancelled: false,
                 timeout: None,
+                output_limit_exceeded: false,
+                output_limit: None,
+            }
+        }
+
+        fn failure() -> Self {
+            Self {
+                success: false,
+                code: Some(1),
+                signal: None,
+                timed_out: false,
+                cancelled: false,
+                timeout: None,
+                output_limit_exceeded: false,
+                output_limit: None,
             }
         }
     }
@@ -883,6 +1071,83 @@ mod tests {
 
         wait_for_calls(&reader.calls, 1).await;
         assert_eq!(trigger.calls.load(Ordering::SeqCst), 0);
+        let _ = shutdown.send(true);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn initial_ready_waits_for_successful_startup_baseline() {
+        let reader = Arc::new(TestStateReader::new(&["baseline"]));
+        let trigger = Arc::new(TestTrigger::new(Duration::ZERO));
+        let (_events_tx, events_rx) = mpsc::channel(64);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let runner = FsStateRunner::new_with_settle(
+            "local",
+            Duration::from_millis(5),
+            Duration::from_millis(50),
+            Duration::ZERO,
+            Some(reader.clone() as Arc<dyn StateReader>),
+            trigger,
+            None,
+        );
+        let handle = tokio::spawn(runner.run_with_initial_ready(events_rx, shutdown_rx, ready_tx));
+
+        let ready = timeout(Duration::from_secs(2), ready_rx)
+            .await
+            .expect("timed out waiting for readiness")
+            .expect("readiness sender dropped");
+        assert!(ready.is_ok());
+        assert_eq!(reader.calls.load(Ordering::SeqCst), 1);
+
+        let _ = shutdown_tx.send(true);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn initial_ready_fails_when_startup_baseline_fails() {
+        let reader = Arc::new(TestStateReader::new_with_failures(&[], 1));
+        let trigger = Arc::new(TestTrigger::new(Duration::ZERO));
+        let (_events_tx, events_rx) = mpsc::channel(64);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let runner = FsStateRunner::new_with_settle(
+            "local",
+            Duration::from_millis(5),
+            Duration::from_millis(50),
+            Duration::ZERO,
+            Some(reader.clone() as Arc<dyn StateReader>),
+            trigger,
+            None,
+        );
+        let handle = tokio::spawn(runner.run_with_initial_ready(events_rx, shutdown_rx, ready_tx));
+
+        let ready = timeout(Duration::from_secs(2), ready_rx)
+            .await
+            .expect("timed out waiting for readiness")
+            .expect("readiness sender dropped");
+        assert!(ready.is_err());
+        assert_eq!(reader.calls.load(Ordering::SeqCst), 1);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unknown_startup_baseline_triggers_on_first_successful_state_read() {
+        let reader = Arc::new(TestStateReader::new_with_failures(&["changed", "after"], 1));
+        let trigger = Arc::new(TestTrigger::new(Duration::ZERO));
+        let (events, shutdown, handle) = spawn_test_runner(
+            Some(Arc::clone(&reader)),
+            Arc::clone(&trigger),
+            Duration::from_millis(5),
+            Duration::from_millis(50),
+        );
+
+        wait_for_calls(&reader.calls, 1).await;
+        events.send(FsStateEvent::Changed).await.unwrap();
+        wait_for_calls(&trigger.calls, 1).await;
+        wait_for_calls(&reader.calls, 3).await;
+        assert_eq!(trigger.calls.load(Ordering::SeqCst), 1);
+
         let _ = shutdown.send(true);
         handle.await.unwrap();
     }
@@ -942,7 +1207,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unchanged_state_does_not_trigger_command() {
+    async fn successful_startup_baseline_avoids_trigger_when_state_is_unchanged() {
         let reader = Arc::new(TestStateReader::new(&["base", "base"]));
         let trigger = Arc::new(TestTrigger::new(Duration::ZERO));
         let (events, shutdown, handle) = spawn_test_runner(
@@ -961,7 +1226,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn changed_state_triggers_command_and_rebaseline() {
+    async fn changed_state_with_successful_command_rebaselines() {
         let reader = Arc::new(TestStateReader::new(&["base", "changed", "after"]));
         let trigger = Arc::new(TestTrigger::new(Duration::ZERO));
         let (events, shutdown, handle) = spawn_test_runner(
@@ -977,6 +1242,79 @@ mod tests {
         assert_eq!(trigger.calls.load(Ordering::SeqCst), 1);
         let _ = shutdown.send(true);
         handle.await.unwrap();
+    }
+
+    async fn assert_unsuccessful_command_does_not_rebaseline(result: TestTriggerResult) {
+        let reader = Arc::new(TestStateReader::new(&["base", "changed", "after"]));
+        let trigger = Arc::new(TestTrigger::with_result(result));
+        let (events, shutdown, handle) = spawn_test_runner(
+            Some(Arc::clone(&reader)),
+            Arc::clone(&trigger),
+            Duration::from_millis(200),
+            Duration::from_millis(500),
+        );
+        wait_for_calls(&reader.calls, 1).await;
+        events.send(FsStateEvent::Changed).await.unwrap();
+        wait_for_calls(&reader.calls, 2).await;
+        wait_for_calls(&trigger.calls, 1).await;
+        sleep(Duration::from_millis(40)).await;
+        assert_eq!(reader.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(trigger.calls.load(Ordering::SeqCst), 1);
+        let _ = shutdown.send(true);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn changed_state_with_failed_command_does_not_rebaseline() {
+        assert_unsuccessful_command_does_not_rebaseline(TestTriggerResult::ExitFailure).await;
+    }
+
+    #[tokio::test]
+    async fn failed_command_causes_retry_instead_of_swallowing_change() {
+        let reader = Arc::new(TestStateReader::new(&[
+            "base", "changed", "changed", "changed",
+        ]));
+        let trigger = Arc::new(TestTrigger::with_result(TestTriggerResult::ExitFailure));
+        let (events, shutdown, handle) = spawn_test_runner(
+            Some(Arc::clone(&reader)),
+            Arc::clone(&trigger),
+            Duration::from_millis(5),
+            Duration::from_millis(50),
+        );
+        wait_for_calls(&reader.calls, 1).await;
+        events.send(FsStateEvent::Changed).await.unwrap();
+        wait_for_calls(&trigger.calls, 2).await;
+        assert!(reader.calls.load(Ordering::SeqCst) >= 3);
+        let _ = shutdown.send(true);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn command_submission_failure_keeps_source_dirty() {
+        let reader = Arc::new(TestStateReader::new(&["base", "changed", "changed"]));
+        let trigger = Arc::new(TestTrigger::with_result(TestTriggerResult::SubmitFailure));
+        let (events, shutdown, handle) = spawn_test_runner(
+            Some(Arc::clone(&reader)),
+            Arc::clone(&trigger),
+            Duration::from_millis(5),
+            Duration::from_millis(50),
+        );
+        wait_for_calls(&reader.calls, 1).await;
+        events.send(FsStateEvent::Changed).await.unwrap();
+        wait_for_calls(&reader.calls, 3).await;
+        assert_eq!(trigger.calls.load(Ordering::SeqCst), 0);
+        let _ = shutdown.send(true);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn timed_out_command_does_not_rebaseline() {
+        assert_unsuccessful_command_does_not_rebaseline(TestTriggerResult::TimedOut).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_command_does_not_rebaseline() {
+        assert_unsuccessful_command_does_not_rebaseline(TestTriggerResult::Cancelled).await;
     }
 
     #[tokio::test]
@@ -1009,6 +1347,7 @@ mod tests {
             calls: Arc::new(AtomicUsize::new(0)),
             delay: Duration::from_millis(30),
             event_during_run: Some(events_tx.clone()),
+            result: TestTriggerResult::Success,
         });
         let runner = FsStateRunner::new_with_settle(
             "local",

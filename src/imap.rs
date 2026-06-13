@@ -60,12 +60,24 @@ enum RunEnd {
     Shutdown,
 }
 
+struct MailboxRunContext<'a> {
+    account: &'a AccountConfig,
+    mailbox: &'a MailboxConfig,
+    events: &'a mpsc::Sender<()>,
+    state: &'a Arc<RuntimeState>,
+    watcher_id: &'a str,
+    initial_ready: &'a mut Option<oneshot::Sender<Result<(), String>>>,
+    established: &'a mut bool,
+    shutdown: &'a mut watch::Receiver<bool>,
+    settings: WatcherSettings,
+}
+
 pub async fn watch_mailbox_forever(
     account: AccountConfig,
     mailbox: MailboxConfig,
     events: mpsc::Sender<()>,
     state: Arc<RuntimeState>,
-    mut initial_ready: Option<oneshot::Sender<()>>,
+    mut initial_ready: Option<oneshot::Sender<Result<(), String>>>,
     mut shutdown: watch::Receiver<bool>,
     settings: WatcherSettings,
 ) {
@@ -79,19 +91,21 @@ pub async fn watch_mailbox_forever(
 
         state.mark_watcher(&watcher_id, WatcherPhase::Connecting);
         let mut established = false;
-        match run_mailbox_once(
-            &account,
-            &mailbox,
-            &events,
-            &state,
-            &watcher_id,
-            &mut initial_ready,
-            &mut established,
-            &mut shutdown,
-            settings,
-        )
-        .await
-        {
+        let run_result = {
+            let mut context = MailboxRunContext {
+                account: &account,
+                mailbox: &mailbox,
+                events: &events,
+                state: &state,
+                watcher_id: &watcher_id,
+                initial_ready: &mut initial_ready,
+                established: &mut established,
+                shutdown: &mut shutdown,
+                settings,
+            };
+            run_mailbox_once(&mut context).await
+        };
+        match run_result {
             Ok(RunEnd::Shutdown) => break,
             Err(error) => {
                 warn!(
@@ -121,25 +135,14 @@ pub async fn watch_mailbox_forever(
     );
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_mailbox_once(
-    account: &AccountConfig,
-    mailbox: &MailboxConfig,
-    events: &mpsc::Sender<()>,
-    state: &Arc<RuntimeState>,
-    watcher_id: &str,
-    initial_ready: &mut Option<oneshot::Sender<()>>,
-    established: &mut bool,
-    shutdown: &mut watch::Receiver<bool>,
-    settings: WatcherSettings,
-) -> Result<RunEnd, ImapError> {
-    validate_imap_string("username", &account.username)?;
-    validate_imap_string("mailbox name", &mailbox.name)?;
+async fn run_mailbox_once(context: &mut MailboxRunContext<'_>) -> Result<RunEnd, ImapError> {
+    validate_imap_string("username", &context.account.username)?;
+    validate_imap_string("mailbox name", &context.mailbox.name)?;
 
     let stream = connect(
-        account,
-        settings.connect_timeout,
-        settings.operation_timeout,
+        context.account,
+        context.settings.connect_timeout,
+        context.settings.operation_timeout,
     )
     .await?;
     let (read_half, mut write_half) = tokio::io::split(stream);
@@ -147,56 +150,47 @@ async fn run_mailbox_once(
     let mut tags = Tags::default();
 
     with_imap_timeout(
-        settings.operation_timeout,
+        context.settings.operation_timeout,
         "IMAP greeting",
         read_greeting(&mut reader),
     )
     .await?;
     let credentials = auth::credentials_for(
-        account,
-        settings.auth_helper_timeout,
-        settings.auth_helper_max_output_bytes,
+        context.account,
+        context.settings.auth_helper_timeout,
+        context.settings.auth_helper_max_output_bytes,
     )
     .await?;
     with_imap_timeout(
-        settings.operation_timeout,
+        context.settings.operation_timeout,
         "IMAP authentication",
         authenticate(
             &mut reader,
             &mut write_half,
             &mut tags,
-            &account.username,
+            &context.account.username,
             credentials,
         ),
     )
     .await?;
     with_imap_timeout(
-        settings.operation_timeout,
+        context.settings.operation_timeout,
         "SELECT",
-        select_mailbox(&mut reader, &mut write_half, &mut tags, &mailbox.name),
+        select_mailbox(
+            &mut reader,
+            &mut write_half,
+            &mut tags,
+            &context.mailbox.name,
+        ),
     )
     .await?;
 
     info!(
-        account = %account.name,
-        mailbox = %mailbox.name,
+        account = %context.account.name,
+        mailbox = %context.mailbox.name,
         "IMAP login/select succeeded; entering IDLE"
     );
-    idle_forever(
-        &mut reader,
-        &mut write_half,
-        &mut tags,
-        events,
-        state,
-        watcher_id,
-        account,
-        mailbox,
-        initial_ready,
-        established,
-        shutdown,
-        settings,
-    )
-    .await
+    idle_forever(&mut reader, &mut write_half, &mut tags, context).await
 }
 
 async fn connect(
@@ -351,20 +345,11 @@ where
     wait_tagged(reader, &tag, "SELECT").await
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn idle_forever<R, W>(
     reader: &mut R,
     writer: &mut W,
     tags: &mut Tags,
-    events: &mpsc::Sender<()>,
-    state: &Arc<RuntimeState>,
-    watcher_id: &str,
-    account: &AccountConfig,
-    mailbox: &MailboxConfig,
-    initial_ready: &mut Option<oneshot::Sender<()>>,
-    established: &mut bool,
-    shutdown: &mut watch::Receiver<bool>,
-    settings: WatcherSettings,
+    context: &mut MailboxRunContext<'_>,
 ) -> Result<RunEnd, ImapError>
 where
     R: AsyncBufRead + Unpin,
@@ -374,49 +359,53 @@ where
         let tag = tags.next();
         let idle_command = format!("{tag} IDLE\r\n");
         with_imap_timeout(
-            settings.operation_timeout,
+            context.settings.operation_timeout,
             "IDLE command",
             write_raw(writer, idle_command.as_bytes()),
         )
         .await?;
         with_imap_timeout(
-            settings.operation_timeout,
+            context.settings.operation_timeout,
             "IDLE continuation",
             wait_idle_continuation(reader, &tag),
         )
         .await?;
-        state.mark_watcher(watcher_id, WatcherPhase::Idling);
-        if !*established {
-            *established = true;
-            if let Some(sender) = initial_ready.take() {
-                let _ = sender.send(());
+        context
+            .state
+            .mark_watcher(context.watcher_id, WatcherPhase::Idling);
+        if !*context.established {
+            *context.established = true;
+            if let Some(sender) = context.initial_ready.take() {
+                let _ = sender.send(Ok(()));
             }
         }
         info!(
-            account = %account.name,
-            mailbox = %mailbox.name,
+            account = %context.account.name,
+            mailbox = %context.mailbox.name,
             "IMAP IDLE started"
         );
 
-        let refresh = sleep(settings.idle_refresh);
+        let refresh = sleep(context.settings.idle_refresh);
         tokio::pin!(refresh);
         loop {
             let mut line = String::new();
             tokio::select! {
-                changed = shutdown.changed() => {
-                    if changed.is_ok() && *shutdown.borrow() {
-                        let _ = finish_idle(reader, writer, &tag, settings.operation_timeout).await;
+                changed = context.shutdown.changed() => {
+                    if changed.is_ok() && *context.shutdown.borrow() {
+                        let _ = finish_idle(reader, writer, &tag, context.settings.operation_timeout).await;
                         return Ok(RunEnd::Shutdown);
                     }
                 }
                 () = &mut refresh => {
                     info!(
-                        account = %account.name,
-                        mailbox = %mailbox.name,
+                        account = %context.account.name,
+                        mailbox = %context.mailbox.name,
                         "IMAP IDLE refresh"
                     );
-                    finish_idle(reader, writer, &tag, settings.operation_timeout).await?;
-                    state.mark_watcher(watcher_id, WatcherPhase::Idling);
+                    finish_idle(reader, writer, &tag, context.settings.operation_timeout).await?;
+                    context
+                        .state
+                        .mark_watcher(context.watcher_id, WatcherPhase::Idling);
                     break;
                 }
                 read = reader.read_line(&mut line) => {
@@ -430,8 +419,8 @@ where
                     }
                     if is_tagged_ok(line, &tag) {
                         debug!(
-                            account = %account.name,
-                            mailbox = %mailbox.name,
+                            account = %context.account.name,
+                            mailbox = %context.mailbox.name,
                             "server ended IDLE; re-entering"
                         );
                         break;
@@ -439,22 +428,24 @@ where
                     if is_tagged_completion(line, &tag) {
                         return Err(ImapError::CommandRejected { command: "IDLE" });
                     }
-                    state.mark_watcher(watcher_id, WatcherPhase::Idling);
+                    context
+                        .state
+                        .mark_watcher(context.watcher_id, WatcherPhase::Idling);
                     if is_mailbox_change(line) {
-                        state.mark_event();
-                        match events.try_send(()) {
+                        context.state.mark_event();
+                        match context.events.try_send(()) {
                             Ok(()) => {}
                             Err(mpsc::error::TrySendError::Full(())) => {
                                 debug!(
-                                    account = %account.name,
-                                    mailbox = %mailbox.name,
+                                    account = %context.account.name,
+                                    mailbox = %context.mailbox.name,
                                     "mailbox event queue is full; coalescing event"
                                 );
                             }
                             Err(mpsc::error::TrySendError::Closed(())) => {
                                 warn!(
-                                    account = %account.name,
-                                    mailbox = %mailbox.name,
+                                    account = %context.account.name,
+                                    mailbox = %context.mailbox.name,
                                     "mailbox event queue is closed"
                                 );
                             }
