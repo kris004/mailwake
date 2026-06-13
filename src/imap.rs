@@ -72,16 +72,28 @@ struct MailboxRunContext<'a> {
     settings: WatcherSettings,
 }
 
-pub async fn watch_mailbox_forever(
-    account: AccountConfig,
-    mailbox: MailboxConfig,
-    events: mpsc::Sender<()>,
-    state: Arc<RuntimeState>,
-    mut initial_ready: Option<oneshot::Sender<Result<(), String>>>,
-    mut shutdown: watch::Receiver<bool>,
-    settings: WatcherSettings,
-) {
-    let watcher_id = watcher_id(&account.name, &mailbox.name);
+pub struct MailboxWatchTask {
+    pub account: AccountConfig,
+    pub mailbox: MailboxConfig,
+    pub events: mpsc::Sender<()>,
+    pub state: Arc<RuntimeState>,
+    pub watcher_id: String,
+    pub initial_ready: Option<oneshot::Sender<Result<(), String>>>,
+    pub shutdown: watch::Receiver<bool>,
+    pub settings: WatcherSettings,
+}
+
+pub async fn watch_mailbox_forever(task: MailboxWatchTask) {
+    let MailboxWatchTask {
+        account,
+        mailbox,
+        events,
+        state,
+        watcher_id,
+        mut initial_ready,
+        mut shutdown,
+        settings,
+    } = task;
     let mut backoff = INITIAL_BACKOFF;
 
     loop {
@@ -615,10 +627,6 @@ fn is_mailbox_change(line: &str) -> bool {
         || upper.contains(" RECENT")
         || upper.contains(" FETCH")
         || upper.contains(" VANISHED")
-}
-
-fn watcher_id(account: &str, mailbox: &str) -> String {
-    format!("{account}/{mailbox}")
 }
 
 #[derive(Default)]

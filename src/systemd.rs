@@ -110,13 +110,13 @@ pub async fn run_status_task(
                     warn!(%error, "failed to send systemd status notification");
                 }
                 if notifier.watchdog_interval().is_some() {
-                    if state.is_healthy() {
+                    if let Some(reason) = state.health_problem() {
+                        warn!(%reason, "runtime health check failed; withholding systemd watchdog ping");
+                        let _ = notifier.status(&format!("mailwake unhealthy: {reason}"));
+                    } else {
                         if let Err(error) = notifier.watchdog() {
                             warn!(%error, "failed to send systemd watchdog notification");
                         }
-                    } else {
-                        warn!("watcher health check failed; withholding systemd watchdog ping");
-                        let _ = notifier.status("mailwake unhealthy; watchdog ping withheld");
                     }
                 }
             }

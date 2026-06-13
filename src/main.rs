@@ -645,15 +645,16 @@ fn spawn_watcher(task: ImapWatcherTask) -> JoinHandle<()> {
     let account_name = task.account.name.clone();
     let mailbox_name = task.mailbox.name.clone();
     let handle = tokio::spawn(async move {
-        imap::watch_mailbox_forever(
-            task.account,
-            task.mailbox,
-            task.event_tx,
-            task.state,
-            task.initial_ready,
-            task.shutdown,
-            task.settings,
-        )
+        imap::watch_mailbox_forever(imap::MailboxWatchTask {
+            account: task.account,
+            mailbox: task.mailbox,
+            events: task.event_tx,
+            state: task.state,
+            watcher_id: task.watcher_id,
+            initial_ready: task.initial_ready,
+            shutdown: task.shutdown,
+            settings: task.settings,
+        })
         .await;
     });
 

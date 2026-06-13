@@ -249,39 +249,64 @@ impl RuntimeState {
     }
 
     pub fn is_healthy(&self) -> bool {
-        let inner = self.inner.lock().expect("runtime state mutex poisoned");
-        self.watchers_healthy(&inner) && self.command_runners_healthy(&inner)
+        self.health_problem().is_none()
     }
 
-    fn watchers_healthy(&self, inner: &RuntimeInner) -> bool {
+    pub fn health_problem(&self) -> Option<String> {
+        let inner = self.inner.lock().expect("runtime state mutex poisoned");
+        self.watchers_health_problem(&inner)
+            .or_else(|| self.command_runners_health_problem(&inner))
+    }
+
+    fn watchers_health_problem(&self, inner: &RuntimeInner) -> Option<String> {
         if inner.watchers.len() != self.total_sources {
-            return false;
+            return Some(format!(
+                "watcher count is {}, expected {}",
+                inner.watchers.len(),
+                self.total_sources
+            ));
         }
-        inner.watchers.values().all(|watcher| {
+        inner.watchers.iter().find_map(|(id, watcher)| {
             if matches!(watcher.phase, WatcherPhase::Crashed | WatcherPhase::Stopped) {
-                return false;
+                return Some(format!("watcher {id:?} is {}", watcher.phase));
             }
-            watcher.last_progress.elapsed() <= self.watcher_stale
+            let elapsed = watcher.last_progress.elapsed();
+            if elapsed > self.watcher_stale {
+                return Some(format!(
+                    "watcher {id:?} stale for {}s, limit {}s",
+                    elapsed.as_secs(),
+                    self.watcher_stale.as_secs()
+                ));
+            }
+            None
         })
     }
 
-    fn command_runners_healthy(&self, inner: &RuntimeInner) -> bool {
+    fn command_runners_health_problem(&self, inner: &RuntimeInner) -> Option<String> {
         if inner.command_runners.len() != self.total_command_lanes {
-            return false;
+            return Some(format!(
+                "command runner count is {}, expected {}",
+                inner.command_runners.len(),
+                self.total_command_lanes
+            ));
         }
-        inner.command_runners.values().all(|runner| {
+        inner.command_runners.iter().find_map(|(id, runner)| {
             if matches!(
                 runner.phase,
                 CommandRunnerPhase::Crashed | CommandRunnerPhase::Stopped
             ) {
-                return false;
+                return Some(format!("command runner {id:?} is {}", runner.phase));
             }
             if let Some(started) = runner.command_started
                 && started.elapsed() > self.command_timeout
             {
-                return false;
+                return Some(format!(
+                    "command runner {id:?} running for {}s, limit {}s",
+                    started.elapsed().as_secs(),
+                    self.command_timeout.as_secs()
+                ));
             }
-            true
+            None
         })
     }
 }
