@@ -16,6 +16,12 @@ use tracing::{debug, info, warn};
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
 
+#[derive(Clone, Copy, Debug)]
+pub struct WatcherSettings {
+    pub idle_refresh: Duration,
+    pub auth_helper_timeout: Duration,
+}
+
 trait ImapStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T> ImapStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 type BoxedImapStream = Box<dyn ImapStream>;
@@ -50,7 +56,7 @@ pub async fn watch_mailbox_forever(
     state: Arc<RuntimeState>,
     mut initial_ready: Option<oneshot::Sender<()>>,
     mut shutdown: watch::Receiver<bool>,
-    idle_refresh: Duration,
+    settings: WatcherSettings,
 ) {
     let watcher_id = watcher_id(&account.name, &mailbox.name);
     let mut backoff = INITIAL_BACKOFF;
@@ -71,7 +77,7 @@ pub async fn watch_mailbox_forever(
             &mut initial_ready,
             &mut established,
             &mut shutdown,
-            idle_refresh,
+            settings,
         )
         .await
         {
@@ -114,9 +120,9 @@ async fn run_mailbox_once(
     initial_ready: &mut Option<oneshot::Sender<()>>,
     established: &mut bool,
     shutdown: &mut watch::Receiver<bool>,
-    idle_refresh: Duration,
+    settings: WatcherSettings,
 ) -> Result<RunEnd, ImapError> {
-    let credentials = auth::credentials_for(account).await?;
+    let credentials = auth::credentials_for(account, settings.auth_helper_timeout).await?;
     let stream = connect(account).await?;
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
@@ -150,7 +156,7 @@ async fn run_mailbox_once(
         initial_ready,
         established,
         shutdown,
-        idle_refresh,
+        settings.idle_refresh,
     )
     .await
 }

@@ -1,5 +1,5 @@
 use crate::command::{CommandExecutor, CommandOutcome};
-use crate::state::RuntimeState;
+use crate::state::{CommandRunnerPhase, RuntimeState};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
@@ -12,6 +12,7 @@ pub struct DebounceRunner {
     debounce: Duration,
     executor: Arc<dyn CommandExecutor>,
     state: Option<Arc<RuntimeState>>,
+    runner_id: String,
 }
 
 impl DebounceRunner {
@@ -22,16 +23,21 @@ impl DebounceRunner {
         executor: Arc<dyn CommandExecutor>,
         state: Option<Arc<RuntimeState>>,
     ) -> Self {
+        let account = account.into();
+        let mailbox = mailbox.into();
+        let runner_id = format!("{account}/{mailbox}");
         Self {
-            account: account.into(),
-            mailbox: mailbox.into(),
+            account,
+            mailbox,
             debounce,
             executor,
             state,
+            runner_id,
         }
     }
 
     pub async fn run(self, mut events: mpsc::Receiver<()>, mut shutdown: watch::Receiver<bool>) {
+        self.mark_runner(CommandRunnerPhase::Idle);
         loop {
             let got_event = tokio::select! {
                 changed = shutdown.changed() => {
@@ -49,6 +55,7 @@ impl DebounceRunner {
             self.mark_event();
 
             loop {
+                self.mark_runner(CommandRunnerPhase::Debouncing);
                 if !sleep_or_shutdown(self.debounce, &mut shutdown).await {
                     return;
                 }
@@ -69,6 +76,12 @@ impl DebounceRunner {
         }
     }
 
+    fn mark_runner(&self, phase: CommandRunnerPhase) {
+        if let Some(state) = &self.state {
+            state.mark_command_runner(&self.runner_id, phase);
+        }
+    }
+
     fn drain_events(&self, events: &mut mpsc::Receiver<()>) -> bool {
         let mut saw_event = false;
         while let Ok(()) = events.try_recv() {
@@ -84,11 +97,15 @@ impl DebounceRunner {
             mailbox = %self.mailbox,
             "starting notification command"
         );
+        if let Some(state) = &self.state {
+            state.mark_command_started(&self.runner_id);
+        }
         match self.executor.run().await {
             Ok(outcome) => self.record_outcome(outcome),
             Err(error) => {
                 if let Some(state) = &self.state {
                     state.mark_command_error();
+                    state.mark_command_runner(&self.runner_id, CommandRunnerPhase::Idle);
                 }
                 error!(
                     account = %self.account,
@@ -102,7 +119,7 @@ impl DebounceRunner {
 
     fn record_outcome(&self, outcome: CommandOutcome) {
         if let Some(state) = &self.state {
-            state.mark_command_outcome(&outcome);
+            state.mark_command_finished(&self.runner_id, &outcome);
         }
         if outcome.success {
             info!(
@@ -173,6 +190,8 @@ mod tests {
                     success: this.success,
                     code: Some(if this.success { 0 } else { 1 }),
                     signal: None,
+                    timed_out: false,
+                    timeout: None,
                 })
             })
         }

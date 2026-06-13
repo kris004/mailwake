@@ -4,8 +4,10 @@ use std::fmt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 use thiserror::Error;
 use tokio::process::Command;
+use tokio::time::timeout;
 
 #[derive(Clone)]
 pub enum Credentials {
@@ -35,6 +37,8 @@ pub enum AuthError {
     },
     #[error("auth helper failed with {status}")]
     HelperFailed { status: String },
+    #[error("auth helper timed out after {seconds} seconds")]
+    HelperTimedOut { seconds: u64 },
     #[error("auth helper wrote non-UTF-8 output")]
     HelperOutputUtf8,
     #[error("auth helper returned an empty secret")]
@@ -74,38 +78,10 @@ pub fn validate_auth_helpers(config: &Config) -> Result<(), AuthError> {
     Ok(())
 }
 
-pub async fn preflight_auth_helpers(config: &Config) -> Result<(), AuthError> {
-    for account in &config.accounts {
-        match account.auth {
-            AuthMethod::Xoauth2Cmd => {
-                let cmd =
-                    account
-                        .xoauth2_cmd
-                        .as_deref()
-                        .ok_or_else(|| AuthError::MissingAuthField {
-                            account: account.name.clone(),
-                            method: account.auth,
-                        })?;
-                let _secret = run_secret_command(cmd).await?;
-            }
-            AuthMethod::PasswordCmd => {
-                let cmd =
-                    account
-                        .password_cmd
-                        .as_deref()
-                        .ok_or_else(|| AuthError::MissingAuthField {
-                            account: account.name.clone(),
-                            method: account.auth,
-                        })?;
-                let _secret = run_secret_command(cmd).await?;
-            }
-            AuthMethod::Password => {}
-        }
-    }
-    Ok(())
-}
-
-pub async fn credentials_for(account: &AccountConfig) -> Result<Credentials, AuthError> {
+pub async fn credentials_for(
+    account: &AccountConfig,
+    helper_timeout: Duration,
+) -> Result<Credentials, AuthError> {
     match account.auth {
         AuthMethod::Xoauth2Cmd => {
             let cmd =
@@ -116,7 +92,7 @@ pub async fn credentials_for(account: &AccountConfig) -> Result<Credentials, Aut
                         account: account.name.clone(),
                         method: account.auth,
                     })?;
-            let token = run_secret_command(cmd).await?;
+            let token = run_secret_command(cmd, helper_timeout).await?;
             Ok(Credentials::Xoauth2 { token })
         }
         AuthMethod::PasswordCmd => {
@@ -128,7 +104,7 @@ pub async fn credentials_for(account: &AccountConfig) -> Result<Credentials, Aut
                         account: account.name.clone(),
                         method: account.auth,
                     })?;
-            let password = run_secret_command(cmd).await?;
+            let password = run_secret_command(cmd, helper_timeout).await?;
             Ok(Credentials::Password { password })
         }
         AuthMethod::Password => {
@@ -144,16 +120,32 @@ pub async fn credentials_for(account: &AccountConfig) -> Result<Credentials, Aut
     }
 }
 
-pub async fn run_secret_command(command: &str) -> Result<SecretString, AuthError> {
-    let output = Command::new("sh")
+pub async fn run_secret_command(
+    command: &str,
+    helper_timeout: Duration,
+) -> Result<SecretString, AuthError> {
+    let mut process = Command::new("sh");
+    process
         .arg("-c")
         .arg(command)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .output()
-        .await
+        .kill_on_drop(true);
+
+    let child = process
+        .spawn()
         .map_err(|source| AuthError::HelperStart { source })?;
+    // If the timeout fires, dropping the wait future drops the child handle;
+    // kill_on_drop above kills the helper without logging its stdout.
+    let output = match timeout(helper_timeout, child.wait_with_output()).await {
+        Ok(result) => result.map_err(|source| AuthError::HelperStart { source })?,
+        Err(_) => {
+            return Err(AuthError::HelperTimedOut {
+                seconds: helper_timeout.as_secs(),
+            });
+        }
+    };
 
     if !output.status.success() {
         return Err(AuthError::HelperFailed {
@@ -288,7 +280,7 @@ mod tests {
 
     #[tokio::test]
     async fn password_cmd_output_trims_trailing_newlines() {
-        let secret = run_secret_command("printf 'password\\n\\n'")
+        let secret = run_secret_command("printf 'password\\n\\n'", Duration::from_secs(1))
             .await
             .expect("helper should succeed");
         assert_eq!(secret.expose_secret(), "password");
@@ -296,7 +288,7 @@ mod tests {
 
     #[tokio::test]
     async fn xoauth2_cmd_output_trims_trailing_newlines() {
-        let secret = run_secret_command("printf 'ya29.token\\r\\n'")
+        let secret = run_secret_command("printf 'ya29.token\\r\\n'", Duration::from_secs(1))
             .await
             .expect("helper should succeed");
         assert_eq!(secret.expose_secret(), "ya29.token");
@@ -304,12 +296,46 @@ mod tests {
 
     #[tokio::test]
     async fn auth_helper_errors_do_not_include_output() {
-        let err = run_secret_command("printf 'super-secret'; exit 42")
+        let err = run_secret_command("printf 'super-secret'; exit 42", Duration::from_secs(1))
             .await
             .expect_err("helper should fail");
         let text = err.to_string();
         assert!(text.contains("exit status 42"));
         assert!(!text.contains("super-secret"));
+    }
+
+    #[tokio::test]
+    async fn auth_helper_timeout_does_not_include_output() {
+        let err = run_secret_command("printf 'super-secret'; sleep 5", Duration::from_millis(50))
+            .await
+            .expect_err("helper should time out");
+        let text = err.to_string();
+        assert!(text.contains("timed out"));
+        assert!(!text.contains("super-secret"));
+    }
+
+    #[test]
+    fn helper_path_validation_does_not_execute_helper() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let touched = dir.path().join("should-not-exist");
+        let config = Config::parse_str(&format!(
+            r#"
+[[accounts]]
+name = "gmail"
+host = "imap.gmail.com"
+username = "me@example.com"
+auth = "xoauth2_cmd"
+xoauth2_cmd = "sh -c 'touch {}'"
+
+[[accounts.mailboxes]]
+name = "INBOX"
+on_notify = "echo sync"
+"#,
+            touched.display()
+        ))
+        .expect("config should parse");
+        validate_auth_helpers(&config).expect("shell helper path should validate");
+        assert!(!touched.exists());
     }
 
     #[test]

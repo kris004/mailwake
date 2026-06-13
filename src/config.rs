@@ -11,6 +11,8 @@ pub const DEFAULT_DEBOUNCE_SECONDS: u64 = 10;
 pub const DEFAULT_IMAPS_PORT: u16 = 993;
 pub const DEFAULT_IDLE_REFRESH_SECONDS: u64 = 29 * 60;
 pub const DEFAULT_WATCHER_STALE_SECONDS: u64 = 60 * 60;
+pub const DEFAULT_AUTH_HELPER_TIMEOUT_SECONDS: u64 = 30;
+pub const DEFAULT_COMMAND_TIMEOUT_SECONDS: u64 = 300;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -19,6 +21,10 @@ pub struct Config {
     pub default_debounce_seconds: Option<u64>,
     #[serde(default)]
     pub log_command_output: bool,
+    #[serde(default)]
+    pub auth_helper_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub command_timeout_seconds: Option<u64>,
     #[serde(default)]
     pub watcher_stale_seconds: Option<u64>,
     #[serde(default)]
@@ -180,6 +186,38 @@ impl Config {
             ));
         }
 
+        validate_nonzero_seconds(
+            "auth_helper_timeout_seconds",
+            self.auth_helper_timeout_seconds
+                .unwrap_or(DEFAULT_AUTH_HELPER_TIMEOUT_SECONDS),
+        )?;
+        validate_nonzero_seconds(
+            "command_timeout_seconds",
+            self.command_timeout_seconds
+                .unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECONDS),
+        )?;
+
+        let idle_refresh_seconds = self
+            .idle_refresh_seconds
+            .unwrap_or(DEFAULT_IDLE_REFRESH_SECONDS);
+        validate_nonzero_seconds("idle_refresh_seconds", idle_refresh_seconds)?;
+        if idle_refresh_seconds < 60 {
+            return Err(ConfigError::Invalid(format!(
+                "idle_refresh_seconds must be at least 60 seconds, got {idle_refresh_seconds}"
+            )));
+        }
+
+        let watcher_stale_seconds = self
+            .watcher_stale_seconds
+            .unwrap_or(DEFAULT_WATCHER_STALE_SECONDS);
+        validate_nonzero_seconds("watcher_stale_seconds", watcher_stale_seconds)?;
+        let minimum_watcher_stale = idle_refresh_seconds.saturating_mul(2);
+        if watcher_stale_seconds < minimum_watcher_stale {
+            return Err(ConfigError::Invalid(format!(
+                "watcher_stale_seconds must be at least 2x idle_refresh_seconds ({minimum_watcher_stale} seconds), got {watcher_stale_seconds}"
+            )));
+        }
+
         let mut account_names = HashSet::new();
         for account in &self.accounts {
             validate_nonempty("account name", &account.name)?;
@@ -242,6 +280,20 @@ impl Config {
         )
     }
 
+    pub fn auth_helper_timeout(&self) -> Duration {
+        Duration::from_secs(
+            self.auth_helper_timeout_seconds
+                .unwrap_or(DEFAULT_AUTH_HELPER_TIMEOUT_SECONDS),
+        )
+    }
+
+    pub fn command_timeout(&self) -> Duration {
+        Duration::from_secs(
+            self.command_timeout_seconds
+                .unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECONDS),
+        )
+    }
+
     pub fn mailbox_count(&self) -> usize {
         self.accounts
             .iter()
@@ -250,6 +302,9 @@ impl Config {
     }
 
     pub fn warn_for_insecure_options(&self) {
+        if self.default_debounce_seconds == Some(0) {
+            warn!("default_debounce_seconds=0 disables global debounce by explicit configuration");
+        }
         for account in &self.accounts {
             if account.auth == AuthMethod::Password {
                 warn!(
@@ -268,6 +323,15 @@ impl Config {
                     account = %account.name,
                     "TLS certificate verification is disabled by explicit configuration"
                 );
+            }
+            for mailbox in &account.mailboxes {
+                if mailbox.debounce_seconds == Some(0) {
+                    warn!(
+                        account = %account.name,
+                        mailbox = %mailbox.name,
+                        "debounce_seconds=0 disables debounce for this mailbox by explicit configuration"
+                    );
+                }
             }
         }
     }
@@ -316,6 +380,15 @@ impl MailboxConfig {
 fn validate_nonempty(field: &str, value: &str) -> Result<(), ConfigError> {
     if value.trim().is_empty() {
         return Err(ConfigError::Invalid(format!("{field} must not be empty")));
+    }
+    Ok(())
+}
+
+fn validate_nonzero_seconds(field: &str, value: u64) -> Result<(), ConfigError> {
+    if value == 0 {
+        return Err(ConfigError::Invalid(format!(
+            "{field} must be greater than 0 seconds"
+        )));
     }
     Ok(())
 }
@@ -376,6 +449,8 @@ debounce_seconds = 10
         assert_eq!(config.mailbox_count(), 1);
         assert_eq!(config.accounts[0].auth, AuthMethod::Xoauth2Cmd);
         assert_eq!(config.accounts[0].port(), 993);
+        assert_eq!(config.auth_helper_timeout().as_secs(), 30);
+        assert_eq!(config.command_timeout().as_secs(), 300);
         assert_eq!(
             config.accounts[0].mailboxes[0].debounce(&config).as_secs(),
             10
@@ -453,5 +528,104 @@ password = 123
         .expect_err("wrong password type should fail");
         assert!(!err.to_string().contains("123"));
         assert!(!err.to_string().contains("password"));
+    }
+
+    #[test]
+    fn rejects_invalid_runtime_timing_values() {
+        for (field, value) in [
+            ("auth_helper_timeout_seconds", "0"),
+            ("command_timeout_seconds", "0"),
+            ("idle_refresh_seconds", "0"),
+            ("watcher_stale_seconds", "0"),
+        ] {
+            let config = format!(
+                r#"
+{field} = {value}
+
+[[accounts]]
+name = "gmail"
+host = "imap.gmail.com"
+username = "me@example.com"
+auth = "xoauth2_cmd"
+xoauth2_cmd = "gmail-oauth-token"
+
+[[accounts.mailboxes]]
+name = "INBOX"
+on_notify = "echo sync"
+"#
+            );
+            let err = Config::parse_str(&config).expect_err("zero timing value should fail");
+            assert!(err.to_string().contains(field));
+        }
+    }
+
+    #[test]
+    fn rejects_too_small_idle_refresh_and_watcher_stale() {
+        let idle_err = Config::parse_str(
+            r#"
+idle_refresh_seconds = 59
+watcher_stale_seconds = 120
+
+[[accounts]]
+name = "gmail"
+host = "imap.gmail.com"
+username = "me@example.com"
+auth = "xoauth2_cmd"
+xoauth2_cmd = "gmail-oauth-token"
+
+[[accounts.mailboxes]]
+name = "INBOX"
+on_notify = "echo sync"
+"#,
+        )
+        .expect_err("too-small idle refresh should fail");
+        assert!(idle_err.to_string().contains("at least 60"));
+
+        let stale_err = Config::parse_str(
+            r#"
+idle_refresh_seconds = 60
+watcher_stale_seconds = 119
+
+[[accounts]]
+name = "gmail"
+host = "imap.gmail.com"
+username = "me@example.com"
+auth = "xoauth2_cmd"
+xoauth2_cmd = "gmail-oauth-token"
+
+[[accounts.mailboxes]]
+name = "INBOX"
+on_notify = "echo sync"
+"#,
+        )
+        .expect_err("watcher_stale less than 2x idle refresh should fail");
+        assert!(stale_err.to_string().contains("2x idle_refresh_seconds"));
+    }
+
+    #[test]
+    fn allows_explicit_zero_debounce() {
+        let config = Config::parse_str(
+            r#"
+default_debounce_seconds = 0
+
+[[accounts]]
+name = "gmail"
+host = "imap.gmail.com"
+username = "me@example.com"
+auth = "xoauth2_cmd"
+xoauth2_cmd = "gmail-oauth-token"
+
+[[accounts.mailboxes]]
+name = "INBOX"
+on_notify = "echo sync"
+debounce_seconds = 0
+"#,
+        )
+        .expect("zero debounce is allowed when explicitly configured");
+        assert_eq!(config.default_debounce().as_secs(), 0);
+        assert_eq!(
+            config.accounts[0].mailboxes[0].debounce(&config).as_secs(),
+            0
+        );
     }
 }

@@ -5,7 +5,7 @@ use mailwake::command::{CommandExecutor, ShellCommandExecutor, run_shell_command
 use mailwake::config::Config;
 use mailwake::debounce::DebounceRunner;
 use mailwake::imap;
-use mailwake::state::{RuntimeState, WatcherPhase};
+use mailwake::state::{CommandRunnerPhase, RuntimeState, WatcherPhase};
 use mailwake::systemd::{self, Notifier};
 use std::env;
 use std::path::{Path, PathBuf};
@@ -111,7 +111,12 @@ async fn test_command(path: &Path, account_name: &str, mailbox_name: &str) -> Re
         })?;
 
     println!("running configured command for account={account_name:?} mailbox={mailbox_name:?}");
-    let outcome = run_shell_command(&mailbox.on_notify, config.log_command_output).await?;
+    let outcome = run_shell_command(
+        &mailbox.on_notify,
+        config.log_command_output,
+        config.command_timeout(),
+    )
+    .await?;
     println!("command finished with {}", outcome.description());
     if !outcome.success {
         bail!("configured command failed with {}", outcome.description());
@@ -128,12 +133,12 @@ async fn run_daemon(
         Config::load(path).with_context(|| format!("failed to load {}", path.display()))?;
     auth::validate_auth_helpers(&config)?;
     config.warn_for_insecure_options();
-    auth::preflight_auth_helpers(&config).await?;
 
     let state = Arc::new(RuntimeState::new(
         config.accounts.len(),
         config.mailbox_count(),
         config.watcher_stale(),
+        config.command_timeout(),
     ));
     let notifier = Notifier::from_env(systemd_enabled);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -148,8 +153,10 @@ async fn run_daemon(
             let executor: Arc<dyn CommandExecutor> = Arc::new(ShellCommandExecutor::new(
                 Arc::<str>::from(mailbox.on_notify.clone()),
                 config.log_command_output,
+                config.command_timeout(),
             ));
             let debounce = mailbox.debounce(&config);
+            state.register_command_runner(watcher_id.clone());
             let debounce_runner = DebounceRunner::new(
                 account.name.clone(),
                 mailbox.name.clone(),
@@ -157,7 +164,15 @@ async fn run_daemon(
                 executor,
                 Some(Arc::clone(&state)),
             );
-            tokio::spawn(debounce_runner.run(event_rx, shutdown_rx.clone()));
+            spawn_command_runner(
+                debounce_runner,
+                event_rx,
+                Arc::clone(&state),
+                watcher_id.clone(),
+                account.name.clone(),
+                mailbox.name.clone(),
+                shutdown_rx.clone(),
+            );
 
             let (ready_tx, ready_rx) = oneshot::channel();
             initial_receivers.push(ready_rx);
@@ -169,7 +184,10 @@ async fn run_daemon(
                 watcher_id,
                 Some(ready_tx),
                 shutdown_rx.clone(),
-                config.idle_refresh(),
+                mailwake::imap::WatcherSettings {
+                    idle_refresh: config.idle_refresh(),
+                    auth_helper_timeout: config.auth_helper_timeout(),
+                },
             );
         }
     }
@@ -212,6 +230,32 @@ async fn run_daemon(
     Ok(())
 }
 
+fn spawn_command_runner(
+    runner: DebounceRunner,
+    event_rx: mpsc::Receiver<()>,
+    state: Arc<RuntimeState>,
+    runner_id: String,
+    account_name: String,
+    mailbox_name: String,
+    shutdown: watch::Receiver<bool>,
+) {
+    let handle = tokio::spawn(runner.run(event_rx, shutdown));
+    tokio::spawn(async move {
+        match handle.await {
+            Ok(()) => state.mark_command_runner(&runner_id, CommandRunnerPhase::Stopped),
+            Err(error) => {
+                state.mark_command_runner(&runner_id, CommandRunnerPhase::Crashed);
+                error!(
+                    account = %account_name,
+                    mailbox = %mailbox_name,
+                    %error,
+                    "command runner task crashed"
+                );
+            }
+        }
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_watcher(
     account: mailwake::config::AccountConfig,
@@ -221,7 +265,7 @@ fn spawn_watcher(
     watcher_id: String,
     initial_ready: Option<oneshot::Sender<()>>,
     shutdown: watch::Receiver<bool>,
-    idle_refresh: std::time::Duration,
+    settings: mailwake::imap::WatcherSettings,
 ) {
     let state_for_task = Arc::clone(&state);
     let account_name = account.name.clone();
@@ -234,7 +278,7 @@ fn spawn_watcher(
             state_for_task,
             initial_ready,
             shutdown,
-            idle_refresh,
+            settings,
         )
         .await;
     });

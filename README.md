@@ -110,6 +110,23 @@ debounce_seconds = 10
 Each configured mailbox gets its own IMAP connection so it can remain selected
 and in IDLE independently.
 
+Useful global knobs:
+
+```toml
+# Defaults shown.
+default_debounce_seconds = 10
+auth_helper_timeout_seconds = 30
+command_timeout_seconds = 300
+idle_refresh_seconds = 1740
+watcher_stale_seconds = 3600
+```
+
+`idle_refresh_seconds` must be at least 60. `watcher_stale_seconds` must be at
+least twice `idle_refresh_seconds`. Auth-helper and command timeouts must be
+nonzero. `debounce_seconds = 0` is allowed when explicitly configured, but it
+means every observed mailbox event can trigger command execution as soon as the
+previous run finishes.
+
 ## CLI
 
 ```sh
@@ -124,8 +141,8 @@ mailwake --initial-connect-required --config ~/.config/mailwake/config.toml
 paths when practical, and does not connect to IMAP, notify systemd, or run mailbox
 commands.
 
-`test-command` runs the configured command for one account/mailbox and reports the
-exit status.
+`test-command` runs the configured command for one account/mailbox, applies
+`command_timeout_seconds`, and reports the exit status or timeout outcome.
 
 ## Basic setup
 
@@ -191,18 +208,24 @@ journalctl --user -u mailwake.service -f
 ```
 
 The service uses `Type=notify`. With systemd available, `mailwake` sends
-`READY=1` after config parsing, auth-helper checks, auth-helper startup preflight,
-and watcher task spawning. With `--initial-connect-required`, it waits until every
-watcher completes one successful login/select/IDLE setup before `READY=1`.
+`READY=1` after config parsing, auth-helper executable checks, and watcher task
+spawning. It does not execute OAuth/password helpers as a separate startup
+preflight; helpers run when watchers connect and are bounded by
+`auth_helper_timeout_seconds`. With `--initial-connect-required`, readiness waits
+until every watcher completes one successful login/select/IDLE setup before
+`READY=1`.
 
 Readiness is therefore not the same as "currently connected to Gmail" unless
 `--initial-connect-required` is used. Without that flag, network failures are
 handled by the reconnect loop after the service is considered ready.
 
 `WatchdogSec` asks systemd to restart the service if it stops sending watchdog
-pings. `mailwake` sends `WATCHDOG=1` only when watcher tasks are alive and either
-connected/idling or progressing through expected reconnect backoff. If a watcher
-crashes or appears stale, watchdog pings stop so systemd can restart the service.
+pings. `mailwake` sends `WATCHDOG=1` only when IMAP watcher tasks and
+per-mailbox command runner tasks are healthy. Watchers must be alive and either
+connected/idling or progressing through expected reconnect backoff. Command
+runners must be alive and must not have a command running past
+`command_timeout_seconds`. If a task crashes, appears stale, or wedges, watchdog
+pings stop so systemd can restart the service.
 
 If `NOTIFY_SOCKET` and `WATCHDOG_USEC` are absent, `mailwake` runs normally from a
 terminal, cron, OpenRC, or anything else.
@@ -252,7 +275,7 @@ make test
 make clippy
 ```
 
-The test suite covers config parsing/validation, auth helper trimming and
-redaction behavior, debounce/coalescing, non-overlapping command execution,
-dirty-mailbox reruns, command success/failure handling, and systemd notification
-isolation.
+The test suite covers config parsing/validation, auth helper trimming, timeouts
+and redaction behavior, debounce/coalescing, non-overlapping command execution,
+dirty-mailbox reruns, command success/failure/timeout handling, command runner
+health, watchdog health, and systemd notification isolation.

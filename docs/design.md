@@ -17,8 +17,10 @@ sync tools, password managers, and OAuth helpers stay outside the daemon.
 - Each mailbox has a dedicated debounce/command task.
 - Commands for the same mailbox are serialized by that task; overlapping runs are
   impossible in normal operation.
-- Authentication secrets are obtained on connection/reconnection and wrapped in a
-  redacted secret type.
+- Authentication secrets are obtained on connection/reconnection with a bounded
+  helper timeout and wrapped in a redacted secret type.
+- Notification commands have a bounded runtime. Timeout is a command outcome, not
+  a daemon-fatal error.
 
 ## Authentication
 
@@ -31,12 +33,14 @@ without printing the password value.
 
 ## Readiness and watchdog
 
-Config parsing, auth-helper path checks, and initial auth-helper execution happen
-before `READY=1`. Network connection setup is supervised by watcher tasks. With
-`--initial-connect-required`, readiness also waits for every watcher to complete
-one successful login/select/IDLE setup.
+Config parsing and auth-helper path checks happen before `READY=1`. The daemon
+intentionally avoids a separate auth-helper execution preflight so startup does
+not double-run OAuth/password helpers. Helper execution happens in watcher tasks
+and is bounded by `auth_helper_timeout_seconds`. With `--initial-connect-required`,
+readiness also waits for every watcher to complete one successful
+login/select/IDLE setup.
 
 Systemd notification is opportunistic. Without `NOTIFY_SOCKET`, `mailwake` runs
-normally. Watchdog pings are sent only while the supervisor believes every
-watcher task is either connected/idling or progressing through its reconnect
-loop.
+normally. Watchdog pings are sent only while the supervisor believes every IMAP watcher
+task is either connected/idling or progressing through its reconnect loop, every
+command runner task is alive, and no command has exceeded its configured timeout.
