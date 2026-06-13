@@ -128,12 +128,12 @@ auth_helper_timeout_seconds = 30
 auth_helper_max_output_bytes = 65536
 command_timeout_seconds = 300
 command_output_max_bytes = 1048576
+command_output_tail_lines = 100
 connect_timeout_seconds = 30
 imap_operation_timeout_seconds = 60
 idle_refresh_seconds = 1740
 watcher_stale_seconds = 3600
 min_command_interval_seconds = 60
-capture_command_output = false
 ```
 
 `idle_refresh_seconds` must be at least 60. `watcher_stale_seconds` must be at
@@ -155,6 +155,8 @@ lane = "mail-sync"
 cmd = "sync-remote"
 timeout_seconds = 300
 min_interval_seconds = 60
+output_mode = "failure_tail"
+output_tail_lines = 100
 
 [[commands]]
 name = "local-push"
@@ -162,6 +164,8 @@ lane = "mail-sync"
 cmd = "push-local"
 timeout_seconds = 300
 min_interval_seconds = 30
+output_mode = "failure_tail"
+output_tail_lines = 100
 ```
 
 Only one command in a lane runs at a time. Repeated requests for the same
@@ -172,12 +176,57 @@ different lanes can run independently.
 observed source event can trigger command execution as soon as cooldown and the
 previous run permit.
 
-`capture_command_output` is normally false. If enabled, `mailwake` captures
-notification command stdout/stderr and logs only byte counts. Captured output is
-capped by `command_output_max_bytes` (default 1 MiB); if a command exceeds the
-cap, `mailwake` kills the command process group and reports a command failure
-without logging the output contents. The old `log_command_output` name still
-parses for compatibility but logs a deprecation warning.
+### Notification command output
+
+Auth helper output is secret and is never logged. Notification command output is
+not automatically a secret, but it may contain sensitive mail data, so command
+output logging is configurable and capped.
+
+Named commands support:
+
+```toml
+output_mode = "failure_tail"
+output_max_bytes = 1048576
+output_tail_lines = 100
+```
+
+`output_mode` values:
+
+- `silent`: log command start, completion status, duration, and exit
+  status/signal only. Do not capture or log stdout/stderr.
+- `failure_tail`: the default. Capture stdout/stderr up to `output_max_bytes`
+  and log only the last `output_tail_lines` on command failure, timeout,
+  shutdown cancellation, output-limit failure, or spawn/wait error.
+- `tail`: capture stdout/stderr up to `output_max_bytes` and log the last
+  `output_tail_lines` on both success and failure.
+- `debug`: capture stdout/stderr up to `output_max_bytes` and log the last
+  `output_tail_lines` at debug level only.
+- `journal`: stream child stdout/stderr to `mailwake` stdout/stderr so
+  systemd/journald can capture it live. This is useful for debugging but may
+  expose sensitive mail-related output.
+
+If captured command output exceeds `output_max_bytes`, `mailwake` terminates the
+command process group and reports a command failure. It still logs at most the
+configured tail, never the entire captured output. Completion logs include the
+command name, duration, status, output mode, byte counts, and whether output was
+captured, truncated, suppressed, or streamed to the journal. `mailwake` does not
+log the full command environment or put the full shell command in systemd status
+messages.
+
+Deprecated `capture_command_output` and `log_command_output` config fields still
+parse for compatibility, but new configs should use per-command `output_mode`.
+
+Example command with the safe default made explicit:
+
+```toml
+[[commands]]
+name = "gmail-local-push"
+lane = "gmail-sync"
+cmd = "cd /home/alice/.mail/example && flock -n .sync.lock gmi push"
+timeout_seconds = 300
+output_mode = "failure_tail"
+output_tail_lines = 100
+```
 
 Usernames, mailbox names, and direct LOGIN passwords must not contain CR/LF.
 This prevents unsafe IMAP command construction before anything is sent to the

@@ -136,12 +136,14 @@ pub async fn run_secret_command(
     .map_err(AuthError::from)?
     {
         ShellRun::Completed(output) => output,
-        ShellRun::TimedOut => {
+        ShellRun::TimedOut(_) => {
             return Err(AuthError::HelperTimedOut {
                 seconds: helper_timeout.as_secs(),
             });
         }
-        ShellRun::Cancelled => unreachable!("auth helpers are not run with shutdown cancellation"),
+        ShellRun::Cancelled(_) => {
+            unreachable!("auth helpers are not run with shutdown cancellation")
+        }
         ShellRun::OutputLimitExceeded(exceeded) => {
             return Err(AuthError::HelperOutputTooLarge {
                 limit: exceeded.limit,

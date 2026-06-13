@@ -1,7 +1,9 @@
 use anyhow::{Context, Result, bail};
 use clap::{ArgGroup, Parser, Subcommand};
 use mailwake::auth;
-use mailwake::command::{ShellCommandExecutor, run_shell_command_with_output_limit};
+use mailwake::command::{
+    CommandOutputPolicy, ShellCommandExecutor, run_named_shell_command_with_policy,
+};
 use mailwake::config::{Config, MailboxConfig, SourceConfig, legacy_source_name};
 use mailwake::debounce::DebounceRunner;
 use mailwake::fs_state::{
@@ -138,17 +140,13 @@ async fn test_command(
     let config =
         Config::load(path).with_context(|| format!("failed to load {}", path.display()))?;
     config.warn_for_insecure_options();
-    let (command, timeout, description) =
+    let (command_name, command, timeout, output_policy, description) =
         configured_test_command(&config, command_name, account_name, mailbox_name)?;
 
     println!("running configured command for {description}");
-    let outcome = run_shell_command_with_output_limit(
-        command,
-        config.capture_command_output(),
-        timeout,
-        config.command_output_max_bytes(),
-    )
-    .await?;
+    let outcome =
+        run_named_shell_command_with_policy(&command_name, command, timeout, output_policy, None)
+            .await?;
     println!("command finished with {}", outcome.description());
     if !outcome.success {
         bail!("configured command failed with {}", outcome.description());
@@ -161,7 +159,7 @@ fn configured_test_command<'a>(
     command_name: Option<&str>,
     account_name: Option<&str>,
     mailbox_name: Option<&str>,
-) -> Result<(&'a str, Duration, String)> {
+) -> Result<(String, &'a str, Duration, CommandOutputPolicy, String)> {
     match (command_name, account_name, mailbox_name) {
         (Some(name), None, None) => {
             let command = config
@@ -170,16 +168,20 @@ fn configured_test_command<'a>(
                 .find(|command| command.name == name)
                 .with_context(|| format!("command {name:?} not found"))?;
             Ok((
+                command.name.clone(),
                 &command.cmd,
                 command.timeout(config),
+                command.output_policy(config),
                 format!("command={name:?}"),
             ))
         }
         (None, Some(account), Some(mailbox)) => {
-            let (command, timeout) = mailbox_command(config, account, mailbox)?;
+            let (name, command, timeout) = mailbox_command(config, account, mailbox)?;
             Ok((
+                name,
                 command,
                 timeout,
+                config.command_output_policy(),
                 format!("account={account:?} mailbox={mailbox:?}"),
             ))
         }
@@ -191,7 +193,7 @@ fn mailbox_command<'a>(
     config: &'a Config,
     account_name: &str,
     mailbox_name: &str,
-) -> Result<(&'a str, Duration)> {
+) -> Result<(String, &'a str, Duration)> {
     if let Some(account) = config
         .accounts
         .iter()
@@ -201,7 +203,11 @@ fn mailbox_command<'a>(
             .iter()
             .find(|mailbox| mailbox.name == mailbox_name)
     {
-        return Ok((&mailbox.on_notify, config.command_timeout()));
+        return Ok((
+            legacy_source_name(&account.name, &mailbox.name),
+            &mailbox.on_notify,
+            config.command_timeout(),
+        ));
     }
 
     for source in &config.sources {
@@ -219,7 +225,7 @@ fn mailbox_command<'a>(
                         source.name, source.on_event
                     )
                 })?;
-            return Ok((&command.cmd, command.timeout(config)));
+            return Ok((command.name.clone(), &command.cmd, command.timeout(config)));
         }
     }
 
@@ -240,6 +246,7 @@ struct RuntimeCommandSpec {
     cmd: String,
     timeout: Duration,
     min_interval: Duration,
+    output_policy: CommandOutputPolicy,
 }
 
 fn runtime_command_specs(config: &Config) -> Vec<RuntimeCommandSpec> {
@@ -253,6 +260,7 @@ fn runtime_command_specs(config: &Config) -> Vec<RuntimeCommandSpec> {
                 cmd: mailbox.on_notify.clone(),
                 timeout: config.command_timeout(),
                 min_interval: config.min_command_interval(),
+                output_policy: config.command_output_policy(),
             });
         }
     }
@@ -263,6 +271,7 @@ fn runtime_command_specs(config: &Config) -> Vec<RuntimeCommandSpec> {
             cmd: command.cmd.clone(),
             timeout: command.timeout(config),
             min_interval: command.min_interval(config),
+            output_policy: command.output_policy(config),
         });
     }
     commands
@@ -332,15 +341,18 @@ async fn run_daemon(
         state.register_command_runner(lane.clone());
         let lane_commands = commands
             .into_iter()
-            .map(|command| LaneCommand {
-                name: Arc::<str>::from(command.name),
-                executor: Arc::new(ShellCommandExecutor::new(
-                    Arc::<str>::from(command.cmd),
-                    config.capture_command_output(),
-                    command.timeout,
-                    config.command_output_max_bytes(),
-                )),
-                min_interval: command.min_interval,
+            .map(|command| {
+                let command_name = Arc::<str>::from(command.name);
+                LaneCommand {
+                    name: Arc::clone(&command_name),
+                    executor: Arc::new(ShellCommandExecutor::new(
+                        command_name,
+                        Arc::<str>::from(command.cmd),
+                        command.timeout,
+                        command.output_policy,
+                    )),
+                    min_interval: command.min_interval,
+                }
             })
             .collect();
         let lane_runner = CommandLaneRunner::new(
@@ -1011,11 +1023,16 @@ on_change = "local-push"
         )
         .expect("config should parse");
 
-        let (command, timeout, description) =
+        let (name, command, timeout, output_policy, description) =
             configured_test_command(&config, Some("local-push"), None, None)
                 .expect("command should be found");
+        assert_eq!(name, "local-push");
         assert_eq!(command, "echo push");
         assert_eq!(timeout, Duration::from_secs(7));
+        assert_eq!(
+            output_policy.mode,
+            mailwake::command::CommandOutputMode::FailureTail
+        );
         assert_eq!(description, "command=\"local-push\"");
     }
 
@@ -1039,11 +1056,16 @@ on_notify = "echo sync"
         )
         .expect("config should parse");
 
-        let (command, timeout, description) =
+        let (name, command, timeout, output_policy, description) =
             configured_test_command(&config, None, Some("gmail"), Some("INBOX"))
                 .expect("legacy command should be found");
+        assert_eq!(name, "gmail/INBOX");
         assert_eq!(command, "echo sync");
         assert_eq!(timeout, Duration::from_secs(30));
+        assert_eq!(
+            output_policy.mode,
+            mailwake::command::CommandOutputMode::FailureTail
+        );
         assert_eq!(description, "account=\"gmail\" mailbox=\"INBOX\"");
     }
 

@@ -6,6 +6,7 @@ default_debounce_seconds = 10
 default_max_debounce_seconds = 60
 command_timeout_seconds = 300
 command_output_max_bytes = 1048576
+command_output_tail_lines = 100
 min_command_interval_seconds = 60
 
 [[commands]]
@@ -14,6 +15,8 @@ lane = "example-sync"
 cmd = "cd /home/alice/.mail/example && flock -n .sync.lock gmi sync && notmuch new"
 timeout_seconds = 300
 min_interval_seconds = 60
+output_mode = "failure_tail"
+output_tail_lines = 100
 
 [[commands]]
 name = "local-push"
@@ -21,6 +24,8 @@ lane = "example-sync"
 cmd = "cd /home/alice/.mail/example && flock -n .sync.lock gmi push"
 timeout_seconds = 300
 min_interval_seconds = 30
+output_mode = "failure_tail"
+output_tail_lines = 100
 
 [[accounts]]
 name = "example-imap"

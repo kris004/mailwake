@@ -94,10 +94,10 @@ impl StateReader for ShellStateReader {
                         String::from_utf8(output.stdout).map_err(|_| StateReadError::Utf8)?;
                     Ok(trim_trailing_crlf(&stdout).to_string())
                 }
-                ShellRun::TimedOut => Err(StateReadError::TimedOut {
+                ShellRun::TimedOut(_) => Err(StateReadError::TimedOut {
                     seconds: timeout.as_secs(),
                 }),
-                ShellRun::Cancelled => Err(StateReadError::Cancelled),
+                ShellRun::Cancelled(_) => Err(StateReadError::Cancelled),
                 ShellRun::OutputLimitExceeded(exceeded) => Err(StateReadError::OutputTooLarge {
                     limit: exceeded.limit,
                 }),

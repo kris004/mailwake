@@ -1,5 +1,6 @@
 use std::io;
 use std::process::{ExitStatus, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use thiserror::Error;
@@ -11,24 +12,102 @@ use tokio::time::{Instant, sleep, timeout};
 const TERMINATE_GRACE: Duration = Duration::from_secs(2);
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShellStreamMode {
+    Null,
+    Capture,
+    Inherit,
+}
+
+#[derive(Debug, Default)]
+pub struct ShellCapturedOutput {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
+}
+
+impl ShellCapturedOutput {
+    pub fn stdout_len(&self) -> usize {
+        self.stdout.len()
+    }
+
+    pub fn stderr_len(&self) -> usize {
+        self.stderr.len()
+    }
+
+    pub fn captured_any(&self) -> bool {
+        !(self.stdout.is_empty() && self.stderr.is_empty())
+    }
+}
+
 #[derive(Debug)]
 pub struct ShellOutput {
     pub status: ExitStatus,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+impl ShellOutput {
+    fn new(status: ExitStatus, captured: ShellCapturedOutput) -> Self {
+        Self {
+            status,
+            stdout: captured.stdout,
+            stderr: captured.stderr,
+            stdout_truncated: captured.stdout_truncated,
+            stderr_truncated: captured.stderr_truncated,
+        }
+    }
+
+    pub fn captured_output(&self) -> ShellCapturedOutput {
+        ShellCapturedOutput {
+            stdout: self.stdout.clone(),
+            stderr: self.stderr.clone(),
+            stdout_truncated: self.stdout_truncated,
+            stderr_truncated: self.stderr_truncated,
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct OutputLimitExceeded {
     pub stream: &'static str,
     pub limit: usize,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
+}
+
+impl OutputLimitExceeded {
+    fn new(first: PipeLimitExceeded, captured: ShellCapturedOutput) -> Self {
+        Self {
+            stream: first.stream,
+            limit: first.limit,
+            stdout: captured.stdout,
+            stderr: captured.stderr,
+            stdout_truncated: captured.stdout_truncated,
+            stderr_truncated: captured.stderr_truncated,
+        }
+    }
+
+    pub fn captured_output(&self) -> ShellCapturedOutput {
+        ShellCapturedOutput {
+            stdout: self.stdout.clone(),
+            stderr: self.stderr.clone(),
+            stdout_truncated: self.stdout_truncated,
+            stderr_truncated: self.stderr_truncated,
+        }
+    }
 }
 
 #[derive(Debug)]
 pub enum ShellRun {
     Completed(ShellOutput),
-    TimedOut,
-    Cancelled,
+    TimedOut(ShellCapturedOutput),
+    Cancelled(ShellCapturedOutput),
     OutputLimitExceeded(OutputLimitExceeded),
 }
 
@@ -36,17 +115,24 @@ enum End {
     Completed(ExitStatus),
     TimedOut,
     Cancelled,
-    OutputLimitExceeded(OutputLimitExceeded),
+    OutputLimitExceeded(PipeLimitExceeded),
 }
 
 enum PipeOutput {
     Data(Vec<u8>),
-    TooLarge(OutputLimitExceeded),
+    TooLarge(PipeLimitExceeded),
 }
 
 enum PipeReadError {
     Io(io::Error),
-    TooLarge(OutputLimitExceeded),
+    TooLarge(PipeLimitExceeded),
+}
+
+#[derive(Clone, Debug)]
+struct PipeLimitExceeded {
+    stream: &'static str,
+    limit: usize,
+    output: Vec<u8>,
 }
 
 #[derive(Debug, Error)]
@@ -76,6 +162,33 @@ pub async fn run_shell_process(
     output_limit: Option<usize>,
     shutdown: Option<watch::Receiver<bool>>,
 ) -> Result<ShellRun, ShellProcessError> {
+    run_shell_process_with_streams(
+        command,
+        if capture_stdout {
+            ShellStreamMode::Capture
+        } else {
+            ShellStreamMode::Null
+        },
+        if capture_stderr {
+            ShellStreamMode::Capture
+        } else {
+            ShellStreamMode::Null
+        },
+        command_timeout,
+        output_limit,
+        shutdown,
+    )
+    .await
+}
+
+pub async fn run_shell_process_with_streams(
+    command: &str,
+    stdout_mode: ShellStreamMode,
+    stderr_mode: ShellStreamMode,
+    command_timeout: Duration,
+    output_limit: Option<usize>,
+    shutdown: Option<watch::Receiver<bool>>,
+) -> Result<ShellRun, ShellProcessError> {
     let mut process = Command::new("sh");
     process
         .arg("-c")
@@ -84,16 +197,7 @@ pub async fn run_shell_process(
         .kill_on_drop(true);
     configure_process_group(&mut process);
 
-    if capture_stdout {
-        process.stdout(Stdio::piped());
-    } else {
-        process.stdout(Stdio::null());
-    }
-    if capture_stderr {
-        process.stderr(Stdio::piped());
-    } else {
-        process.stderr(Stdio::null());
-    }
+    configure_stdio(&mut process, stdout_mode, stderr_mode);
 
     let mut child = process
         .spawn()
@@ -101,15 +205,16 @@ pub async fn run_shell_process(
     let pgid = child.id().map(|id| id as libc::pid_t);
 
     let (limit_tx, limit_rx) = mpsc::unbounded_channel();
+    let shared_limit = output_limit.map(SharedOutputLimit::new);
     let stdout_task = child
         .stdout
         .take()
-        .map(|pipe| read_pipe(pipe, "stdout", output_limit, limit_tx.clone()));
+        .map(|pipe| read_pipe(pipe, "stdout", shared_limit.clone(), limit_tx.clone()));
     let stderr_task = child
         .stderr
         .take()
-        .map(|pipe| read_pipe(pipe, "stderr", output_limit, limit_tx));
-    let mut limit_rx = output_limit.map(|_| limit_rx);
+        .map(|pipe| read_pipe(pipe, "stderr", shared_limit.clone(), limit_tx.clone()));
+    let mut limit_rx = shared_limit.map(|_| limit_rx);
 
     let mut shutdown = shutdown;
     let end = wait_for_child(
@@ -122,40 +227,89 @@ pub async fn run_shell_process(
     .await?;
 
     let run = match end {
-        End::Completed(status) => {
-            let stdout = collect_pipe(stdout_task).await?;
-            let stderr = collect_pipe(stderr_task).await?;
-            match (stdout, stderr) {
-                (PipeOutput::TooLarge(exceeded), _) | (_, PipeOutput::TooLarge(exceeded)) => {
-                    ShellRun::OutputLimitExceeded(exceeded)
-                }
-                (PipeOutput::Data(stdout), PipeOutput::Data(stderr)) => {
-                    ShellRun::Completed(ShellOutput {
-                        status,
-                        stdout,
-                        stderr,
-                    })
+        End::Completed(status) => match collect_captured_output(stdout_task, stderr_task).await? {
+            CollectedOutput::Captured(captured) => {
+                ShellRun::Completed(ShellOutput::new(status, captured))
+            }
+            CollectedOutput::TooLarge(first, captured) => {
+                ShellRun::OutputLimitExceeded(OutputLimitExceeded::new(first, captured))
+            }
+        },
+        End::TimedOut => match collect_captured_output(stdout_task, stderr_task).await? {
+            CollectedOutput::Captured(captured) => ShellRun::TimedOut(captured),
+            CollectedOutput::TooLarge(first, captured) => {
+                ShellRun::OutputLimitExceeded(OutputLimitExceeded::new(first, captured))
+            }
+        },
+        End::Cancelled => match collect_captured_output(stdout_task, stderr_task).await? {
+            CollectedOutput::Captured(captured) => ShellRun::Cancelled(captured),
+            CollectedOutput::TooLarge(first, captured) => {
+                ShellRun::OutputLimitExceeded(OutputLimitExceeded::new(first, captured))
+            }
+        },
+        End::OutputLimitExceeded(first) => {
+            match collect_captured_output(stdout_task, stderr_task).await? {
+                CollectedOutput::Captured(captured) | CollectedOutput::TooLarge(_, captured) => {
+                    ShellRun::OutputLimitExceeded(OutputLimitExceeded::new(first, captured))
                 }
             }
-        }
-        End::TimedOut => {
-            drain_pipe(stdout_task).await;
-            drain_pipe(stderr_task).await;
-            ShellRun::TimedOut
-        }
-        End::Cancelled => {
-            drain_pipe(stdout_task).await;
-            drain_pipe(stderr_task).await;
-            ShellRun::Cancelled
-        }
-        End::OutputLimitExceeded(exceeded) => {
-            drain_pipe(stdout_task).await;
-            drain_pipe(stderr_task).await;
-            ShellRun::OutputLimitExceeded(exceeded)
         }
     };
 
     Ok(run)
+}
+
+fn configure_stdio(
+    process: &mut Command,
+    stdout_mode: ShellStreamMode,
+    stderr_mode: ShellStreamMode,
+) {
+    match stdout_mode {
+        ShellStreamMode::Null => {
+            process.stdout(Stdio::null());
+        }
+        ShellStreamMode::Capture => {
+            process.stdout(Stdio::piped());
+        }
+        ShellStreamMode::Inherit => {
+            process.stdout(Stdio::inherit());
+        }
+    }
+
+    match stderr_mode {
+        ShellStreamMode::Null => {
+            process.stderr(Stdio::null());
+        }
+        ShellStreamMode::Capture => {
+            process.stderr(Stdio::piped());
+        }
+        ShellStreamMode::Inherit => {
+            process.stderr(Stdio::inherit());
+        }
+    }
+}
+
+#[derive(Clone)]
+struct SharedOutputLimit {
+    limit: usize,
+    used: Arc<Mutex<usize>>,
+}
+
+impl SharedOutputLimit {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            used: Arc::new(Mutex::new(0)),
+        }
+    }
+
+    fn reserve(&self, requested: usize) -> usize {
+        let mut used = self.used.lock().expect("output limit mutex poisoned");
+        let remaining = self.limit.saturating_sub(*used);
+        let allowed = std::cmp::min(remaining, requested);
+        *used = used.saturating_add(allowed);
+        allowed
+    }
 }
 
 async fn wait_for_child(
@@ -163,7 +317,7 @@ async fn wait_for_child(
     pgid: Option<libc::pid_t>,
     command_timeout: Duration,
     shutdown: &mut Option<watch::Receiver<bool>>,
-    limit_rx: &mut Option<mpsc::UnboundedReceiver<OutputLimitExceeded>>,
+    limit_rx: &mut Option<mpsc::UnboundedReceiver<PipeLimitExceeded>>,
 ) -> Result<End, ShellProcessError> {
     let deadline = Instant::now() + command_timeout;
     loop {
@@ -252,8 +406,8 @@ async fn wait_for_child(
 fn read_pipe<R>(
     mut pipe: R,
     stream: &'static str,
-    limit: Option<usize>,
-    limit_tx: mpsc::UnboundedSender<OutputLimitExceeded>,
+    limit: Option<SharedOutputLimit>,
+    limit_tx: mpsc::UnboundedSender<PipeLimitExceeded>,
 ) -> JoinHandle<Result<Vec<u8>, PipeReadError>>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -268,15 +422,62 @@ where
             if bytes == 0 {
                 return Ok(output);
             }
-            if let Some(limit) = limit
-                && output.len().saturating_add(bytes) > limit
-            {
-                let exceeded = OutputLimitExceeded { stream, limit };
-                let _ = limit_tx.send(exceeded);
-                return Err(PipeReadError::TooLarge(exceeded));
+            if let Some(limit) = &limit {
+                let allowed = limit.reserve(bytes);
+                output.extend_from_slice(&buffer[..allowed]);
+                if allowed < bytes {
+                    let exceeded = PipeLimitExceeded {
+                        stream,
+                        limit: limit.limit,
+                        output,
+                    };
+                    let _ = limit_tx.send(exceeded.clone());
+                    return Err(PipeReadError::TooLarge(exceeded));
+                }
+            } else {
+                output.extend_from_slice(&buffer[..bytes]);
             }
-            output.extend_from_slice(&buffer[..bytes]);
         }
+    })
+}
+
+enum CollectedOutput {
+    Captured(ShellCapturedOutput),
+    TooLarge(PipeLimitExceeded, ShellCapturedOutput),
+}
+
+async fn collect_captured_output(
+    stdout_task: Option<JoinHandle<Result<Vec<u8>, PipeReadError>>>,
+    stderr_task: Option<JoinHandle<Result<Vec<u8>, PipeReadError>>>,
+) -> Result<CollectedOutput, ShellProcessError> {
+    let stdout = collect_pipe(stdout_task).await?;
+    let stderr = collect_pipe(stderr_task).await?;
+    let mut first_exceeded = None;
+    let (stdout, stdout_truncated) = match stdout {
+        PipeOutput::Data(output) => (output, false),
+        PipeOutput::TooLarge(exceeded) => {
+            first_exceeded = Some(exceeded.clone());
+            (exceeded.output, true)
+        }
+    };
+    let (stderr, stderr_truncated) = match stderr {
+        PipeOutput::Data(output) => (output, false),
+        PipeOutput::TooLarge(exceeded) => {
+            if first_exceeded.is_none() {
+                first_exceeded = Some(exceeded.clone());
+            }
+            (exceeded.output, true)
+        }
+    };
+    let captured = ShellCapturedOutput {
+        stdout,
+        stderr,
+        stdout_truncated,
+        stderr_truncated,
+    };
+    Ok(match first_exceeded {
+        Some(exceeded) => CollectedOutput::TooLarge(exceeded, captured),
+        None => CollectedOutput::Captured(captured),
     })
 }
 
@@ -292,12 +493,6 @@ async fn collect_pipe(
         Ok(output) => Ok(PipeOutput::Data(output)),
         Err(PipeReadError::TooLarge(exceeded)) => Ok(PipeOutput::TooLarge(exceeded)),
         Err(PipeReadError::Io(source)) => Err(ShellProcessError::Output { source }),
-    }
-}
-
-async fn drain_pipe(task: Option<JoinHandle<Result<Vec<u8>, PipeReadError>>>) {
-    if let Some(task) = task {
-        let _ = task.await;
     }
 }
 

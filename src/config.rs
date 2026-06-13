@@ -1,4 +1,7 @@
-use crate::command::DEFAULT_COMMAND_OUTPUT_MAX_BYTES;
+use crate::command::{
+    CommandOutputMode, CommandOutputPolicy, DEFAULT_COMMAND_OUTPUT_MAX_BYTES,
+    DEFAULT_COMMAND_OUTPUT_TAIL_LINES,
+};
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::fmt;
@@ -40,6 +43,8 @@ pub struct Config {
     pub command_timeout_seconds: Option<u64>,
     #[serde(default)]
     pub command_output_max_bytes: Option<usize>,
+    #[serde(default)]
+    pub command_output_tail_lines: Option<usize>,
     #[serde(default)]
     pub connect_timeout_seconds: Option<u64>,
     #[serde(default)]
@@ -139,6 +144,12 @@ pub struct CommandConfig {
     pub timeout_seconds: Option<u64>,
     #[serde(default)]
     pub min_interval_seconds: Option<u64>,
+    #[serde(default)]
+    pub output_mode: Option<CommandOutputMode>,
+    #[serde(default)]
+    pub output_max_bytes: Option<usize>,
+    #[serde(default)]
+    pub output_tail_lines: Option<usize>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -298,6 +309,11 @@ impl Config {
             self.command_output_max_bytes
                 .unwrap_or(DEFAULT_COMMAND_OUTPUT_MAX_BYTES),
         )?;
+        validate_nonzero_count(
+            "command_output_tail_lines",
+            self.command_output_tail_lines
+                .unwrap_or(DEFAULT_COMMAND_OUTPUT_TAIL_LINES),
+        )?;
         validate_nonzero_seconds(
             "connect_timeout_seconds",
             self.connect_timeout_seconds
@@ -402,6 +418,12 @@ impl Config {
             if let Some(timeout) = command.timeout_seconds {
                 validate_nonzero_seconds("command timeout_seconds", timeout)?;
             }
+            if let Some(output_max_bytes) = command.output_max_bytes {
+                validate_nonzero_bytes("command output_max_bytes", output_max_bytes)?;
+            }
+            if let Some(output_tail_lines) = command.output_tail_lines {
+                validate_nonzero_count("command output_tail_lines", output_tail_lines)?;
+            }
             if !command_names.insert(command.name.clone()) {
                 return Err(ConfigError::Invalid(format!(
                     "duplicate command name {:?}",
@@ -462,6 +484,26 @@ impl Config {
     pub fn command_output_max_bytes(&self) -> usize {
         self.command_output_max_bytes
             .unwrap_or(DEFAULT_COMMAND_OUTPUT_MAX_BYTES)
+    }
+
+    pub fn command_output_tail_lines(&self) -> usize {
+        self.command_output_tail_lines
+            .unwrap_or(DEFAULT_COMMAND_OUTPUT_TAIL_LINES)
+    }
+
+    pub fn command_output_policy(&self) -> CommandOutputPolicy {
+        CommandOutputPolicy {
+            mode: self.default_command_output_mode(),
+            max_bytes: self.command_output_max_bytes(),
+            tail_lines: self.command_output_tail_lines(),
+        }
+    }
+
+    fn default_command_output_mode(&self) -> CommandOutputMode {
+        match self.capture_command_output.or(self.log_command_output) {
+            Some(false) => CommandOutputMode::Silent,
+            Some(true) | None => CommandOutputMode::FailureTail,
+        }
     }
 
     pub fn connect_timeout(&self) -> Duration {
@@ -529,7 +571,10 @@ impl Config {
             );
         }
         if self.log_command_output.is_some() {
-            warn!("log_command_output is deprecated; use capture_command_output instead");
+            warn!("log_command_output is deprecated; use per-command output_mode instead");
+        }
+        if self.capture_command_output.is_some() {
+            warn!("capture_command_output is deprecated; use per-command output_mode instead");
         }
         for account in &self.accounts {
             if account.auth == AuthMethod::Password {
@@ -652,6 +697,15 @@ impl CommandConfig {
         self.min_interval_seconds
             .map(Duration::from_secs)
             .unwrap_or_else(|| config.min_command_interval())
+    }
+
+    pub fn output_policy(&self, config: &Config) -> CommandOutputPolicy {
+        let default = config.command_output_policy();
+        CommandOutputPolicy {
+            mode: self.output_mode.unwrap_or(default.mode),
+            max_bytes: self.output_max_bytes.unwrap_or(default.max_bytes),
+            tail_lines: self.output_tail_lines.unwrap_or(default.tail_lines),
+        }
     }
 }
 
@@ -812,6 +866,15 @@ fn validate_nonzero_bytes(field: &str, value: usize) -> Result<(), ConfigError> 
     Ok(())
 }
 
+fn validate_nonzero_count(field: &str, value: usize) -> Result<(), ConfigError> {
+    if value == 0 {
+        return Err(ConfigError::Invalid(format!(
+            "{field} must be greater than 0"
+        )));
+    }
+    Ok(())
+}
+
 fn require_cmd(
     value: &Option<String>,
     field: &str,
@@ -875,6 +938,11 @@ debounce_seconds = 10
         assert_eq!(config.auth_helper_max_output_bytes(), 65_536);
         assert_eq!(config.command_timeout().as_secs(), 300);
         assert_eq!(config.command_output_max_bytes(), 1_048_576);
+        assert_eq!(config.command_output_tail_lines(), 100);
+        assert_eq!(
+            config.command_output_policy().mode,
+            CommandOutputMode::FailureTail
+        );
         assert_eq!(config.connect_timeout().as_secs(), 30);
         assert_eq!(config.imap_operation_timeout().as_secs(), 60);
         assert_eq!(config.min_command_interval().as_secs(), 60);
@@ -965,6 +1033,7 @@ password = 123
             ("auth_helper_max_output_bytes", "0"),
             ("command_timeout_seconds", "0"),
             ("command_output_max_bytes", "0"),
+            ("command_output_tail_lines", "0"),
             ("connect_timeout_seconds", "0"),
             ("imap_operation_timeout_seconds", "0"),
             ("idle_refresh_seconds", "0"),
@@ -1207,6 +1276,66 @@ on_change = "local-push"
         assert!(!source.run_on_startup);
         assert_eq!(source.debounce(&config).as_secs(), 5);
         assert_eq!(source.max_debounce(&config).as_secs(), 60);
+    }
+
+    #[test]
+    fn command_output_mode_defaults_and_overrides_parse() {
+        let config = Config::parse_str(
+            r#"
+command_output_max_bytes = 1048576
+command_output_tail_lines = 100
+
+[[commands]]
+name = "default-output"
+cmd = "echo default"
+
+[[commands]]
+name = "tail-output"
+cmd = "echo tail"
+output_mode = "tail"
+output_max_bytes = 2048
+output_tail_lines = 5
+
+[[sources]]
+name = "local-state"
+type = "fs_state"
+watch_paths = ["/tmp/app-state"]
+on_change = "default-output"
+"#,
+        )
+        .expect("command output config should parse");
+
+        let default_policy = config.commands[0].output_policy(&config);
+        assert_eq!(default_policy.mode, CommandOutputMode::FailureTail);
+        assert_eq!(default_policy.max_bytes, 1_048_576);
+        assert_eq!(default_policy.tail_lines, 100);
+
+        let tail_policy = config.commands[1].output_policy(&config);
+        assert_eq!(tail_policy.mode, CommandOutputMode::Tail);
+        assert_eq!(tail_policy.max_bytes, 2048);
+        assert_eq!(tail_policy.tail_lines, 5);
+    }
+
+    #[test]
+    fn rejects_invalid_per_command_output_values() {
+        for (field, value) in [("output_max_bytes", "0"), ("output_tail_lines", "0")] {
+            let config = format!(
+                r#"
+[[commands]]
+name = "changed"
+cmd = "echo changed"
+{field} = {value}
+
+[[sources]]
+name = "local-state"
+type = "fs_state"
+watch_paths = ["/tmp/state"]
+on_change = "changed"
+"#
+            );
+            let err = Config::parse_str(&config).expect_err("zero output value should fail");
+            assert!(err.to_string().contains(field));
+        }
     }
 
     #[test]

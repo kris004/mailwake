@@ -1,14 +1,19 @@
+use serde::Deserialize;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::watch;
-use tracing::debug;
+use tracing::{debug, error, info, warn};
 
-use crate::process::{ShellProcessError, ShellRun, run_shell_process};
+use crate::process::{
+    OutputLimitExceeded, ShellCapturedOutput, ShellProcessError, ShellRun, ShellStreamMode,
+    run_shell_process, run_shell_process_with_streams,
+};
 
 pub const DEFAULT_COMMAND_OUTPUT_MAX_BYTES: usize = 1_048_576;
+pub const DEFAULT_COMMAND_OUTPUT_TAIL_LINES: usize = 100;
 
 pub type CommandRunFuture = Pin<Box<dyn Future<Output = CommandRunResult> + Send>>;
 pub type CommandRunResult = Result<CommandOutcome, CommandError>;
@@ -17,43 +22,90 @@ pub trait CommandExecutor: Send + Sync {
     fn run(&self, shutdown: watch::Receiver<bool>) -> CommandRunFuture;
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandOutputMode {
+    Silent,
+    FailureTail,
+    Tail,
+    Debug,
+    Journal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CommandOutputPolicy {
+    pub mode: CommandOutputMode,
+    pub max_bytes: usize,
+    pub tail_lines: usize,
+}
+
+impl Default for CommandOutputPolicy {
+    fn default() -> Self {
+        Self {
+            mode: CommandOutputMode::FailureTail,
+            max_bytes: DEFAULT_COMMAND_OUTPUT_MAX_BYTES,
+            tail_lines: DEFAULT_COMMAND_OUTPUT_TAIL_LINES,
+        }
+    }
+}
+
+impl CommandOutputPolicy {
+    pub fn silent() -> Self {
+        Self {
+            mode: CommandOutputMode::Silent,
+            ..Self::default()
+        }
+    }
+
+    fn captures_output(&self) -> bool {
+        matches!(
+            self.mode,
+            CommandOutputMode::FailureTail | CommandOutputMode::Tail | CommandOutputMode::Debug
+        )
+    }
+
+    fn streams_to_journal(&self) -> bool {
+        self.mode == CommandOutputMode::Journal
+    }
+}
+
 #[derive(Clone)]
 pub struct ShellCommandExecutor {
+    name: Arc<str>,
     command: Arc<str>,
-    capture_output: bool,
     timeout: Duration,
-    output_max_bytes: usize,
+    output_policy: CommandOutputPolicy,
 }
 
 impl ShellCommandExecutor {
     pub fn new(
+        name: impl Into<Arc<str>>,
         command: impl Into<Arc<str>>,
-        capture_output: bool,
         timeout: Duration,
-        output_max_bytes: usize,
+        output_policy: CommandOutputPolicy,
     ) -> Self {
         Self {
+            name: name.into(),
             command: command.into(),
-            capture_output,
             timeout,
-            output_max_bytes,
+            output_policy,
         }
     }
 }
 
 impl CommandExecutor for ShellCommandExecutor {
     fn run(&self, shutdown: watch::Receiver<bool>) -> CommandRunFuture {
+        let name = Arc::clone(&self.name);
         let command = Arc::clone(&self.command);
-        let capture_output = self.capture_output;
         let timeout = self.timeout;
-        let output_max_bytes = self.output_max_bytes;
+        let output_policy = self.output_policy;
         Box::pin(async move {
-            run_shell_command_with_shutdown_and_output_limit(
+            run_named_shell_command_with_policy(
+                &name,
                 &command,
-                capture_output,
                 timeout,
-                output_max_bytes,
-                shutdown,
+                output_policy,
+                Some(shutdown),
             )
             .await
         })
@@ -239,6 +291,76 @@ pub async fn run_shell_command_with_shutdown_and_output_limit(
     .await
 }
 
+pub async fn run_named_shell_command_with_policy(
+    command_name: &str,
+    command: &str,
+    command_timeout: Duration,
+    output_policy: CommandOutputPolicy,
+    shutdown: Option<watch::Receiver<bool>>,
+) -> CommandRunResult {
+    let started = Instant::now();
+    let result =
+        run_shell_command_with_policy(command, command_timeout, output_policy, shutdown).await;
+    let duration = started.elapsed();
+    match &result {
+        Ok(outcome) => log_command_completion(command_name, outcome, duration, output_policy),
+        Err(error) => log_command_error(command_name, error, duration, output_policy),
+    }
+    result.map(|report| report.outcome)
+}
+
+async fn run_shell_command_with_policy(
+    command: &str,
+    command_timeout: Duration,
+    output_policy: CommandOutputPolicy,
+    shutdown: Option<watch::Receiver<bool>>,
+) -> Result<CommandExecutionReport, CommandError> {
+    let stdout_mode = if output_policy.streams_to_journal() {
+        ShellStreamMode::Inherit
+    } else if output_policy.captures_output() {
+        ShellStreamMode::Capture
+    } else {
+        ShellStreamMode::Null
+    };
+    let stderr_mode = stdout_mode;
+    let output_limit = output_policy
+        .captures_output()
+        .then_some(output_policy.max_bytes);
+
+    let run = run_shell_process_with_streams(
+        command,
+        stdout_mode,
+        stderr_mode,
+        command_timeout,
+        output_limit,
+        shutdown,
+    )
+    .await
+    .map_err(CommandError::from)?;
+
+    Ok(match run {
+        ShellRun::Completed(output) => {
+            let outcome = output.status.into();
+            CommandExecutionReport {
+                outcome,
+                output: CommandOutputReport::Captured(output.captured_output()),
+            }
+        }
+        ShellRun::TimedOut(output) => CommandExecutionReport {
+            outcome: CommandOutcome::timed_out(command_timeout),
+            output: CommandOutputReport::Captured(output),
+        },
+        ShellRun::Cancelled(output) => CommandExecutionReport {
+            outcome: CommandOutcome::cancelled(),
+            output: CommandOutputReport::Captured(output),
+        },
+        ShellRun::OutputLimitExceeded(exceeded) => CommandExecutionReport {
+            outcome: CommandOutcome::output_limit_exceeded(exceeded.limit),
+            output: CommandOutputReport::OutputLimitExceeded(exceeded),
+        },
+    })
+}
+
 async fn run_shell_command_inner(
     command: &str,
     capture_output: bool,
@@ -263,16 +385,256 @@ async fn run_shell_command_inner(
                 debug!(
                     stdout_bytes = output.stdout.len(),
                     stderr_bytes = output.stderr.len(),
+                    stdout_truncated = output.stdout_truncated,
+                    stderr_truncated = output.stderr_truncated,
                     "command output captured by explicit debug option"
                 );
             }
             Ok(output.status.into())
         }
-        ShellRun::TimedOut => Ok(CommandOutcome::timed_out(command_timeout)),
-        ShellRun::Cancelled => Ok(CommandOutcome::cancelled()),
+        ShellRun::TimedOut(_) => Ok(CommandOutcome::timed_out(command_timeout)),
+        ShellRun::Cancelled(_) => Ok(CommandOutcome::cancelled()),
         ShellRun::OutputLimitExceeded(exceeded) => {
             Ok(CommandOutcome::output_limit_exceeded(exceeded.limit))
         }
+    }
+}
+
+#[derive(Debug)]
+struct CommandExecutionReport {
+    outcome: CommandOutcome,
+    output: CommandOutputReport,
+}
+
+#[derive(Debug)]
+enum CommandOutputReport {
+    Captured(ShellCapturedOutput),
+    OutputLimitExceeded(OutputLimitExceeded),
+}
+
+impl CommandOutputReport {
+    fn summary(&self, output_policy: CommandOutputPolicy) -> OutputSummary {
+        match self {
+            Self::Captured(output) => OutputSummary {
+                stdout_bytes: output.stdout_len(),
+                stderr_bytes: output.stderr_len(),
+                stdout_truncated: output.stdout_truncated,
+                stderr_truncated: output.stderr_truncated,
+                captured: output_policy.captures_output(),
+                suppressed: output_policy.mode == CommandOutputMode::Silent,
+                journal: output_policy.streams_to_journal(),
+            },
+            Self::OutputLimitExceeded(exceeded) => OutputSummary {
+                stdout_bytes: exceeded.stdout.len(),
+                stderr_bytes: exceeded.stderr.len(),
+                stdout_truncated: exceeded.stdout_truncated,
+                stderr_truncated: exceeded.stderr_truncated,
+                captured: true,
+                suppressed: false,
+                journal: false,
+            },
+        }
+    }
+
+    fn tails(&self, output_policy: CommandOutputPolicy) -> OutputTails {
+        match self {
+            Self::Captured(output) => OutputTails::from_captured(output, output_policy.tail_lines),
+            Self::OutputLimitExceeded(exceeded) => OutputTails::from_bytes(
+                &exceeded.stdout,
+                &exceeded.stderr,
+                output_policy.tail_lines,
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct OutputSummary {
+    stdout_bytes: usize,
+    stderr_bytes: usize,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+    captured: bool,
+    suppressed: bool,
+    journal: bool,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct OutputTails {
+    stdout: Option<String>,
+    stderr: Option<String>,
+}
+
+impl OutputTails {
+    fn from_captured(output: &ShellCapturedOutput, max_lines: usize) -> Self {
+        Self::from_bytes(&output.stdout, &output.stderr, max_lines)
+    }
+
+    fn from_bytes(stdout: &[u8], stderr: &[u8], max_lines: usize) -> Self {
+        Self {
+            stdout: tail_lines(stdout, max_lines),
+            stderr: tail_lines(stderr, max_lines),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.stdout.is_none() && self.stderr.is_none()
+    }
+}
+
+fn log_command_completion(
+    command_name: &str,
+    outcome: &CommandExecutionReport,
+    duration: Duration,
+    output_policy: CommandOutputPolicy,
+) {
+    let summary = outcome.output.summary(output_policy);
+    let status = outcome.outcome.description();
+    if outcome.outcome.success {
+        info!(
+            command = %command_name,
+            status = %status,
+            duration_ms = duration.as_millis(),
+            output_mode = ?output_policy.mode,
+            stdout_bytes = summary.stdout_bytes,
+            stderr_bytes = summary.stderr_bytes,
+            stdout_truncated = summary.stdout_truncated,
+            stderr_truncated = summary.stderr_truncated,
+            output_captured = summary.captured,
+            output_suppressed = summary.suppressed,
+            output_journal = summary.journal,
+            "notification command completed"
+        );
+    } else {
+        warn!(
+            command = %command_name,
+            status = %status,
+            duration_ms = duration.as_millis(),
+            output_mode = ?output_policy.mode,
+            stdout_bytes = summary.stdout_bytes,
+            stderr_bytes = summary.stderr_bytes,
+            stdout_truncated = summary.stdout_truncated,
+            stderr_truncated = summary.stderr_truncated,
+            output_captured = summary.captured,
+            output_suppressed = summary.suppressed,
+            output_journal = summary.journal,
+            "notification command completed"
+        );
+    }
+    log_output_tail_if_needed(
+        command_name,
+        &outcome.outcome,
+        &outcome.output,
+        output_policy,
+    );
+}
+
+fn log_command_error(
+    command_name: &str,
+    error: &CommandError,
+    duration: Duration,
+    output_policy: CommandOutputPolicy,
+) {
+    error!(
+        command = %command_name,
+        %error,
+        duration_ms = duration.as_millis(),
+        output_mode = ?output_policy.mode,
+        output_captured = false,
+        output_suppressed = output_policy.mode == CommandOutputMode::Silent,
+        output_journal = output_policy.mode == CommandOutputMode::Journal,
+        "notification command could not run"
+    );
+}
+
+fn log_output_tail_if_needed(
+    command_name: &str,
+    outcome: &CommandOutcome,
+    output: &CommandOutputReport,
+    output_policy: CommandOutputPolicy,
+) {
+    let plan = output_log_plan(output_policy, outcome, output);
+    if plan.tails.is_empty() {
+        return;
+    }
+    match plan.level {
+        OutputLogLevel::Info => info!(
+            command = %command_name,
+            output_tail_lines = output_policy.tail_lines,
+            stdout_tail = plan.tails.stdout.as_deref().unwrap_or(""),
+            stderr_tail = plan.tails.stderr.as_deref().unwrap_or(""),
+            "notification command output tail"
+        ),
+        OutputLogLevel::Warn => warn!(
+            command = %command_name,
+            output_tail_lines = output_policy.tail_lines,
+            stdout_tail = plan.tails.stdout.as_deref().unwrap_or(""),
+            stderr_tail = plan.tails.stderr.as_deref().unwrap_or(""),
+            "notification command output tail"
+        ),
+        OutputLogLevel::Debug => debug!(
+            command = %command_name,
+            output_tail_lines = output_policy.tail_lines,
+            stdout_tail = plan.tails.stdout.as_deref().unwrap_or(""),
+            stderr_tail = plan.tails.stderr.as_deref().unwrap_or(""),
+            "notification command output tail"
+        ),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OutputLogLevel {
+    Info,
+    Warn,
+    Debug,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct OutputLogPlan {
+    level: OutputLogLevel,
+    tails: OutputTails,
+}
+
+fn output_log_plan(
+    output_policy: CommandOutputPolicy,
+    outcome: &CommandOutcome,
+    output: &CommandOutputReport,
+) -> OutputLogPlan {
+    let should_log_tail = match output_policy.mode {
+        CommandOutputMode::Silent | CommandOutputMode::Journal => false,
+        CommandOutputMode::FailureTail => !outcome.success,
+        CommandOutputMode::Tail | CommandOutputMode::Debug => true,
+    };
+    let level = match output_policy.mode {
+        CommandOutputMode::Debug => OutputLogLevel::Debug,
+        CommandOutputMode::Tail if outcome.success => OutputLogLevel::Info,
+        CommandOutputMode::Tail | CommandOutputMode::FailureTail => OutputLogLevel::Warn,
+        CommandOutputMode::Silent | CommandOutputMode::Journal => OutputLogLevel::Debug,
+    };
+    OutputLogPlan {
+        level,
+        tails: if should_log_tail {
+            output.tails(output_policy)
+        } else {
+            OutputTails {
+                stdout: None,
+                stderr: None,
+            }
+        },
+    }
+}
+
+fn tail_lines(output: &[u8], max_lines: usize) -> Option<String> {
+    if output.is_empty() || max_lines == 0 {
+        return None;
+    }
+    let text = String::from_utf8_lossy(output);
+    let mut lines = text.lines().rev().take(max_lines).collect::<Vec<_>>();
+    lines.reverse();
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
     }
 }
 
@@ -346,12 +708,117 @@ mod tests {
         assert!(!text.contains("super-secret-output"));
     }
 
+    #[test]
+    fn failure_tail_mode_logs_capped_tail_only_on_failure() {
+        let policy = CommandOutputPolicy {
+            mode: CommandOutputMode::FailureTail,
+            max_bytes: 1024,
+            tail_lines: 2,
+        };
+        let output = CommandOutputReport::Captured(ShellCapturedOutput {
+            stdout: b"one\ntwo\nthree\n".to_vec(),
+            stderr: b"err1\nerr2\nerr3\n".to_vec(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+        });
+        let success = CommandOutcome::from(
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg("exit 0")
+                .status()
+                .unwrap(),
+        );
+        assert!(output_log_plan(policy, &success, &output).tails.is_empty());
+
+        let failure = CommandOutcome::from(
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg("exit 1")
+                .status()
+                .unwrap(),
+        );
+        let plan = output_log_plan(policy, &failure, &output);
+        assert_eq!(plan.level, OutputLogLevel::Warn);
+        assert_eq!(plan.tails.stdout.as_deref(), Some("two\nthree"));
+        assert_eq!(plan.tails.stderr.as_deref(), Some("err2\nerr3"));
+    }
+
+    #[test]
+    fn tail_mode_logs_capped_tail_on_success() {
+        let policy = CommandOutputPolicy {
+            mode: CommandOutputMode::Tail,
+            max_bytes: 1024,
+            tail_lines: 1,
+        };
+        let output = CommandOutputReport::Captured(ShellCapturedOutput {
+            stdout: b"first\nlast\n".to_vec(),
+            stderr: Vec::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+        });
+        let success = CommandOutcome::from(
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg("exit 0")
+                .status()
+                .unwrap(),
+        );
+        let plan = output_log_plan(policy, &success, &output);
+        assert_eq!(plan.level, OutputLogLevel::Info);
+        assert_eq!(plan.tails.stdout.as_deref(), Some("last"));
+        assert!(plan.tails.stderr.is_none());
+    }
+
+    #[test]
+    fn silent_mode_does_not_log_output() {
+        let policy = CommandOutputPolicy {
+            mode: CommandOutputMode::Silent,
+            max_bytes: 1024,
+            tail_lines: 100,
+        };
+        let output = CommandOutputReport::Captured(ShellCapturedOutput {
+            stdout: b"visible".to_vec(),
+            stderr: b"error".to_vec(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+        });
+        let failure = CommandOutcome::from(
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg("exit 1")
+                .status()
+                .unwrap(),
+        );
+        assert!(output_log_plan(policy, &failure, &output).tails.is_empty());
+    }
+
+    #[tokio::test]
+    async fn output_max_bytes_kills_command_if_exceeded() {
+        let policy = CommandOutputPolicy {
+            mode: CommandOutputMode::FailureTail,
+            max_bytes: 8,
+            tail_lines: 10,
+        };
+        let outcome = run_named_shell_command_with_policy(
+            "test-command",
+            "yes output | head -c 65536; sleep 30",
+            Duration::from_secs(30),
+            policy,
+            None,
+        )
+        .await
+        .expect("output cap should be reported as an outcome");
+        assert!(!outcome.success);
+        assert!(outcome.output_limit_exceeded);
+        assert_eq!(outcome.output_limit, Some(8));
+    }
+
     #[tokio::test]
     async fn command_timeout_kills_child_process_tree() {
         let dir = tempfile::tempdir().expect("tempdir");
         let pid_file = dir.path().join("sleep.pid");
         let command = format!(
-            "sleep 30 & printf '%s\\n' \"$!\" > {}; wait",
+            "sleep 30 & printf '%s\n' \"$!\" > {}; wait",
             shell_quote(&pid_file)
         );
         let outcome = run_shell_command(&command, false, Duration::from_millis(200))
@@ -368,7 +835,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let pid_file = dir.path().join("sleep.pid");
         let command = format!(
-            "sleep 30 & printf '%s\\n' \"$!\" > {}; wait",
+            "sleep 30 & printf '%s\n' \"$!\" > {}; wait",
             shell_quote(&pid_file)
         );
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
