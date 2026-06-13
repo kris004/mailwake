@@ -12,7 +12,11 @@ pub const DEFAULT_IMAPS_PORT: u16 = 993;
 pub const DEFAULT_IDLE_REFRESH_SECONDS: u64 = 29 * 60;
 pub const DEFAULT_WATCHER_STALE_SECONDS: u64 = 60 * 60;
 pub const DEFAULT_AUTH_HELPER_TIMEOUT_SECONDS: u64 = 30;
+pub const DEFAULT_AUTH_HELPER_MAX_OUTPUT_BYTES: usize = 65_536;
 pub const DEFAULT_COMMAND_TIMEOUT_SECONDS: u64 = 300;
+pub const DEFAULT_CONNECT_TIMEOUT_SECONDS: u64 = 30;
+pub const DEFAULT_IMAP_OPERATION_TIMEOUT_SECONDS: u64 = 60;
+pub const DEFAULT_MIN_COMMAND_INTERVAL_SECONDS: u64 = 60;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -20,11 +24,21 @@ pub struct Config {
     #[serde(default)]
     pub default_debounce_seconds: Option<u64>,
     #[serde(default)]
-    pub log_command_output: bool,
+    pub capture_command_output: Option<bool>,
+    #[serde(default)]
+    pub log_command_output: Option<bool>,
     #[serde(default)]
     pub auth_helper_timeout_seconds: Option<u64>,
     #[serde(default)]
+    pub auth_helper_max_output_bytes: Option<usize>,
+    #[serde(default)]
     pub command_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub connect_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub imap_operation_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub min_command_interval_seconds: Option<u64>,
     #[serde(default)]
     pub watcher_stale_seconds: Option<u64>,
     #[serde(default)]
@@ -191,11 +205,32 @@ impl Config {
             self.auth_helper_timeout_seconds
                 .unwrap_or(DEFAULT_AUTH_HELPER_TIMEOUT_SECONDS),
         )?;
+        validate_nonzero_bytes(
+            "auth_helper_max_output_bytes",
+            self.auth_helper_max_output_bytes
+                .unwrap_or(DEFAULT_AUTH_HELPER_MAX_OUTPUT_BYTES),
+        )?;
         validate_nonzero_seconds(
             "command_timeout_seconds",
             self.command_timeout_seconds
                 .unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECONDS),
         )?;
+        validate_nonzero_seconds(
+            "connect_timeout_seconds",
+            self.connect_timeout_seconds
+                .unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECONDS),
+        )?;
+        validate_nonzero_seconds(
+            "imap_operation_timeout_seconds",
+            self.imap_operation_timeout_seconds
+                .unwrap_or(DEFAULT_IMAP_OPERATION_TIMEOUT_SECONDS),
+        )?;
+        if self.capture_command_output.is_some() && self.log_command_output.is_some() {
+            return Err(ConfigError::Invalid(
+                "use capture_command_output instead of deprecated log_command_output, not both"
+                    .to_string(),
+            ));
+        }
 
         let idle_refresh_seconds = self
             .idle_refresh_seconds
@@ -223,6 +258,7 @@ impl Config {
             validate_nonempty("account name", &account.name)?;
             validate_nonempty("account host", &account.host)?;
             validate_nonempty("account username", &account.username)?;
+            validate_no_crlf("account username", &account.username)?;
             if !account_names.insert(account.name.as_str()) {
                 return Err(ConfigError::Invalid(format!(
                     "duplicate account name {:?}",
@@ -246,6 +282,7 @@ impl Config {
             let mut mailbox_names = HashSet::new();
             for mailbox in &account.mailboxes {
                 validate_nonempty("mailbox name", &mailbox.name)?;
+                validate_no_crlf("mailbox name", &mailbox.name)?;
                 validate_nonempty("mailbox on_notify", &mailbox.on_notify)?;
                 if !mailbox_names.insert(mailbox.name.as_str()) {
                     return Err(ConfigError::Invalid(format!(
@@ -287,11 +324,43 @@ impl Config {
         )
     }
 
+    pub fn auth_helper_max_output_bytes(&self) -> usize {
+        self.auth_helper_max_output_bytes
+            .unwrap_or(DEFAULT_AUTH_HELPER_MAX_OUTPUT_BYTES)
+    }
+
     pub fn command_timeout(&self) -> Duration {
         Duration::from_secs(
             self.command_timeout_seconds
                 .unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECONDS),
         )
+    }
+
+    pub fn connect_timeout(&self) -> Duration {
+        Duration::from_secs(
+            self.connect_timeout_seconds
+                .unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECONDS),
+        )
+    }
+
+    pub fn imap_operation_timeout(&self) -> Duration {
+        Duration::from_secs(
+            self.imap_operation_timeout_seconds
+                .unwrap_or(DEFAULT_IMAP_OPERATION_TIMEOUT_SECONDS),
+        )
+    }
+
+    pub fn min_command_interval(&self) -> Duration {
+        Duration::from_secs(
+            self.min_command_interval_seconds
+                .unwrap_or(DEFAULT_MIN_COMMAND_INTERVAL_SECONDS),
+        )
+    }
+
+    pub fn capture_command_output(&self) -> bool {
+        self.capture_command_output
+            .or(self.log_command_output)
+            .unwrap_or(false)
     }
 
     pub fn mailbox_count(&self) -> usize {
@@ -304,6 +373,14 @@ impl Config {
     pub fn warn_for_insecure_options(&self) {
         if self.default_debounce_seconds == Some(0) {
             warn!("default_debounce_seconds=0 disables global debounce by explicit configuration");
+        }
+        if self.min_command_interval_seconds == Some(0) {
+            warn!(
+                "min_command_interval_seconds=0 disables post-command cooldown by explicit configuration"
+            );
+        }
+        if self.log_command_output.is_some() {
+            warn!("log_command_output is deprecated; use capture_command_output instead");
         }
         for account in &self.accounts {
             if account.auth == AuthMethod::Password {
@@ -355,12 +432,13 @@ impl AccountConfig {
                 forbid_field(&self.password, "password", &self.name, self.auth)?;
             }
             AuthMethod::Password => {
-                if self.password.is_none() {
-                    return Err(ConfigError::Invalid(format!(
+                let password = self.password.as_ref().ok_or_else(|| {
+                    ConfigError::Invalid(format!(
                         "account {:?} uses auth=password but password is missing",
                         self.name
-                    )));
-                }
+                    ))
+                })?;
+                validate_no_crlf("direct password", password.expose_secret())?;
                 forbid_field(&self.xoauth2_cmd, "xoauth2_cmd", &self.name, self.auth)?;
                 forbid_field(&self.password_cmd, "password_cmd", &self.name, self.auth)?;
             }
@@ -384,10 +462,28 @@ fn validate_nonempty(field: &str, value: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
+fn validate_no_crlf(field: &str, value: &str) -> Result<(), ConfigError> {
+    if value.chars().any(|ch| matches!(ch, '\r' | '\n')) {
+        return Err(ConfigError::Invalid(format!(
+            "{field} must not contain CR or LF characters"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_nonzero_seconds(field: &str, value: u64) -> Result<(), ConfigError> {
     if value == 0 {
         return Err(ConfigError::Invalid(format!(
             "{field} must be greater than 0 seconds"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_nonzero_bytes(field: &str, value: usize) -> Result<(), ConfigError> {
+    if value == 0 {
+        return Err(ConfigError::Invalid(format!(
+            "{field} must be greater than 0 bytes"
         )));
     }
     Ok(())
@@ -450,7 +546,12 @@ debounce_seconds = 10
         assert_eq!(config.accounts[0].auth, AuthMethod::Xoauth2Cmd);
         assert_eq!(config.accounts[0].port(), 993);
         assert_eq!(config.auth_helper_timeout().as_secs(), 30);
+        assert_eq!(config.auth_helper_max_output_bytes(), 65_536);
         assert_eq!(config.command_timeout().as_secs(), 300);
+        assert_eq!(config.connect_timeout().as_secs(), 30);
+        assert_eq!(config.imap_operation_timeout().as_secs(), 60);
+        assert_eq!(config.min_command_interval().as_secs(), 60);
+        assert!(!config.capture_command_output());
         assert_eq!(
             config.accounts[0].mailboxes[0].debounce(&config).as_secs(),
             10
@@ -534,7 +635,10 @@ password = 123
     fn rejects_invalid_runtime_timing_values() {
         for (field, value) in [
             ("auth_helper_timeout_seconds", "0"),
+            ("auth_helper_max_output_bytes", "0"),
             ("command_timeout_seconds", "0"),
+            ("connect_timeout_seconds", "0"),
+            ("imap_operation_timeout_seconds", "0"),
             ("idle_refresh_seconds", "0"),
             ("watcher_stale_seconds", "0"),
         ] {
@@ -607,6 +711,7 @@ on_notify = "echo sync"
         let config = Config::parse_str(
             r#"
 default_debounce_seconds = 0
+min_command_interval_seconds = 0
 
 [[accounts]]
 name = "gmail"
@@ -627,5 +732,115 @@ debounce_seconds = 0
             config.accounts[0].mailboxes[0].debounce(&config).as_secs(),
             0
         );
+        assert_eq!(config.min_command_interval().as_secs(), 0);
+    }
+
+    #[test]
+    fn rejects_crlf_in_imap_command_strings() {
+        for (field, bad_line) in [
+            ("username", "username = \"me\\n@example.com\""),
+            ("mailbox", "name = \"IN\\rBOX\""),
+        ] {
+            let config = match field {
+                "username" => format!(
+                    r#"
+[[accounts]]
+name = "gmail"
+host = "imap.gmail.com"
+{bad_line}
+auth = "xoauth2_cmd"
+xoauth2_cmd = "gmail-oauth-token"
+
+[[accounts.mailboxes]]
+name = "INBOX"
+on_notify = "echo sync"
+"#
+                ),
+                "mailbox" => format!(
+                    r#"
+[[accounts]]
+name = "gmail"
+host = "imap.gmail.com"
+username = "me@example.com"
+auth = "xoauth2_cmd"
+xoauth2_cmd = "gmail-oauth-token"
+
+[[accounts.mailboxes]]
+{bad_line}
+on_notify = "echo sync"
+"#
+                ),
+                _ => unreachable!(),
+            };
+            let err = Config::parse_str(&config).expect_err("CR/LF should fail validation");
+            assert!(err.to_string().contains("CR or LF"));
+        }
+    }
+
+    #[test]
+    fn rejects_direct_password_crlf_without_leaking_password() {
+        let err = Config::parse_str(
+            r#"
+[[accounts]]
+name = "local"
+host = "localhost"
+username = "me"
+auth = "password"
+password = "super-secret\nnext-line"
+
+[[accounts.mailboxes]]
+name = "INBOX"
+on_notify = "echo sync"
+"#,
+        )
+        .expect_err("direct password with CR/LF should fail");
+        let text = err.to_string();
+        assert!(text.contains("direct password"));
+        assert!(!text.contains("super-secret"));
+    }
+
+    #[test]
+    fn deprecated_log_command_output_still_parses() {
+        let config = Config::parse_str(
+            r#"
+log_command_output = true
+
+[[accounts]]
+name = "gmail"
+host = "imap.gmail.com"
+username = "me@example.com"
+auth = "xoauth2_cmd"
+xoauth2_cmd = "gmail-oauth-token"
+
+[[accounts.mailboxes]]
+name = "INBOX"
+on_notify = "echo sync"
+"#,
+        )
+        .expect("deprecated field should remain compatible");
+        assert!(config.capture_command_output());
+    }
+
+    #[test]
+    fn rejects_both_command_output_field_names() {
+        let err = Config::parse_str(
+            r#"
+capture_command_output = true
+log_command_output = true
+
+[[accounts]]
+name = "gmail"
+host = "imap.gmail.com"
+username = "me@example.com"
+auth = "xoauth2_cmd"
+xoauth2_cmd = "gmail-oauth-token"
+
+[[accounts.mailboxes]]
+name = "INBOX"
+on_notify = "echo sync"
+"#,
+        )
+        .expect_err("ambiguous output capture fields should fail");
+        assert!(err.to_string().contains("capture_command_output"));
     }
 }

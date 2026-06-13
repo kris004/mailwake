@@ -5,7 +5,7 @@ accounts, waits for mailbox change notifications, debounces/coalesces those
 notifications, and runs configured shell commands.
 
 ```text
-IMAP IDLE event -> debounce/coalesce -> run configured command
+IMAP IDLE event -> debounce/coalesce/cooldown -> run configured command
 ```
 
 The primary use case is Gmail + lieer/gmailieer + notmuch + aerc: let Gmail wake
@@ -36,8 +36,13 @@ is delegated to external commands:
 
 The daemon trims trailing CR/LF from helper output and never logs helper output,
 OAuth tokens, passwords, command stdout/stderr, environment variables, or full
-systemd status details. OAuth token storage and refresh should be handled by the
-helper command.
+systemd status details. Auth helpers are invoked only after TCP/TLS connection
+and the server greeting succeed, so offline/reconnect loops do not repeatedly
+refresh OAuth tokens before Gmail is reachable. Helpers run with
+`auth_helper_timeout_seconds`; if they time out or exceed
+`auth_helper_max_output_bytes`, `mailwake` terminates the helper's Unix process
+group so helper children are not left behind. OAuth token storage and refresh
+should be handled by the helper command.
 
 For Gmail, prefer `xoauth2_cmd`. App-password based accounts can use
 `password_cmd`. A full OAuth browser/device-code flow is intentionally outside
@@ -80,7 +85,7 @@ host = "imap.gmail.com"
 port = 993
 username = "user@example.com"
 auth = "xoauth2_cmd"
-xoauth2_cmd = "gmail-oauth-token"
+xoauth2_cmd = "/home/alice/.local/bin/gmail-oauth-token"
 
 [[accounts.mailboxes]]
 name = "INBOX"
@@ -99,7 +104,7 @@ host = "imap.gmail.com"
 port = 993
 username = "user@example.com"
 auth = "password_cmd"
-password_cmd = "pass show mail/gmail-app-password"
+password_cmd = "/usr/bin/pass show mail/gmail-app-password"
 
 [[accounts.mailboxes]]
 name = "INBOX"
@@ -116,16 +121,38 @@ Useful global knobs:
 # Defaults shown.
 default_debounce_seconds = 10
 auth_helper_timeout_seconds = 30
+auth_helper_max_output_bytes = 65536
 command_timeout_seconds = 300
+connect_timeout_seconds = 30
+imap_operation_timeout_seconds = 60
 idle_refresh_seconds = 1740
 watcher_stale_seconds = 3600
+min_command_interval_seconds = 60
+capture_command_output = false
 ```
 
 `idle_refresh_seconds` must be at least 60. `watcher_stale_seconds` must be at
-least twice `idle_refresh_seconds`. Auth-helper and command timeouts must be
-nonzero. `debounce_seconds = 0` is allowed when explicitly configured, but it
-means every observed mailbox event can trigger command execution as soon as the
-previous run finishes.
+least twice `idle_refresh_seconds`. Auth-helper, command, connect, and IMAP
+operation timeouts must be nonzero. `auth_helper_max_output_bytes` must also be
+nonzero.
+
+`min_command_interval_seconds` is a post-command cooldown that prevents obvious
+self-trigger loops. If events arrive during the cooldown, they are coalesced and
+one command run is scheduled after the cooldown/debounce rules allow it. Set it
+to `0` only if you intentionally want no cooldown.
+
+`debounce_seconds = 0` is allowed when explicitly configured, but it means every
+observed mailbox event can trigger command execution as soon as cooldown and the
+previous run permit.
+
+`capture_command_output` is normally false. If enabled, `mailwake` captures
+notification command stdout/stderr and logs only byte counts. The old
+`log_command_output` name still parses for compatibility but logs a deprecation
+warning.
+
+Usernames, mailbox names, and direct LOGIN passwords must not contain CR/LF.
+This prevents unsafe IMAP command construction before anything is sent to the
+server.
 
 ## CLI
 
@@ -137,9 +164,17 @@ mailwake --no-systemd --config ~/.config/mailwake/config.toml
 mailwake --initial-connect-required --config ~/.config/mailwake/config.toml
 ```
 
-`check-config` parses and validates the config, checks auth-helper executable
-paths when practical, and does not connect to IMAP, notify systemd, or run mailbox
-commands.
+`check-config` parses and validates the config, checks simple auth-helper
+executable paths when practical, and does not connect to IMAP, notify systemd,
+run auth helpers, or run mailbox commands. More complex helper commands using
+shell syntax such as `~`, pipes, redirection, `&&`, or `;` are not rejected just
+because static validation cannot prove the executable path.
+
+Prefer absolute paths for `xoauth2_cmd` and `password_cmd`, especially under
+systemd. A user service may not inherit the same `PATH` as your interactive
+shell, so a helper that works in a terminal as `gmail-oauth-token` may fail in
+the service unless configured as `/home/alice/.local/bin/gmail-oauth-token`
+or the service explicitly sets a suitable `PATH`.
 
 `test-command` runs the configured command for one account/mailbox, applies
 `command_timeout_seconds`, and reports the exit status or timeout outcome.
@@ -161,7 +196,7 @@ Use a Gmail OAuth helper that prints a valid bearer token:
 
 ```toml
 auth = "xoauth2_cmd"
-xoauth2_cmd = "gmail-oauth-token"
+xoauth2_cmd = "/home/alice/.local/bin/gmail-oauth-token"
 ```
 
 ### Example oauth2l helper
@@ -192,7 +227,30 @@ on_notify = "cd ~/.mail/example && flock -n .sync.lock gmi sync && notmuch new"
 
 `flock -n` keeps the sync stack from overlapping itself if something else is
 already syncing. `mailwake` also serializes commands per mailbox and coalesces
-rapid IMAP events.
+rapid IMAP events. The default post-command cooldown helps avoid loops where a
+sync command itself causes immediate follow-up mailbox notifications.
+
+## Command process handling
+
+Notification commands run through `sh -c` in a separate Unix session/process
+group. On command timeout, `mailwake` terminates that process group and reaps the
+shell so child processes such as `sleep`, `gmi`, or `notmuch` are not orphaned by
+the timeout path.
+
+On clean shutdown, running notification commands are also terminated by process
+group before the daemon exits. Command failure, timeout, and shutdown
+cancellation are command outcomes; they do not by themselves kill the daemon.
+
+Auth helpers use the same process-group timeout handling, but their stdout is
+treated as secret material and is never logged.
+
+## IMAP timeouts
+
+`connect_timeout_seconds` bounds TCP connect. `imap_operation_timeout_seconds`
+bounds TLS handshake, greeting read, authentication exchange, `SELECT`, IDLE
+continuation, `DONE`, and tagged response waits. Timeout of an IMAP operation
+causes that watcher to reconnect with exponential backoff. Secrets are not
+included in timeout errors.
 
 ## systemd user service
 
@@ -206,6 +264,16 @@ systemctl --user enable --now mailwake.service
 systemctl --user status mailwake.service
 journalctl --user -u mailwake.service -f
 ```
+
+If your config or `on_notify` commands rely on programs in `~/.local/bin`, add
+or uncomment this in the service:
+
+```ini
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+```
+
+Absolute paths in `xoauth2_cmd`/`password_cmd` are still preferred because they
+make `check-config` and service startup behavior more predictable.
 
 The service uses `Type=notify`. With systemd available, `mailwake` sends
 `READY=1` after config parsing, auth-helper executable checks, and watcher task
@@ -278,4 +346,5 @@ make clippy
 The test suite covers config parsing/validation, auth helper trimming, timeouts
 and redaction behavior, debounce/coalescing, non-overlapping command execution,
 dirty-mailbox reruns, command success/failure/timeout handling, command runner
-health, watchdog health, and systemd notification isolation.
+health, watchdog health, process-tree cleanup, shutdown cancellation, cooldown
+coalescing, IMAP string validation, and systemd notification isolation.

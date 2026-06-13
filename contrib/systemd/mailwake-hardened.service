@@ -6,6 +6,9 @@ After=network-online.target
 [Service]
 Type=notify
 ExecStart=%h/.local/bin/mailwake --config %h/.config/mailwake/config.toml
+# If auth helpers or sync tools are found through ~/.local/bin, and your
+# systemd user manager does not inherit that PATH, uncomment this:
+# Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 Restart=always
 RestartSec=10
 WatchdogSec=2min

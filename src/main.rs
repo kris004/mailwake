@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
+use tokio::time::{Duration, timeout};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -113,7 +115,7 @@ async fn test_command(path: &Path, account_name: &str, mailbox_name: &str) -> Re
     println!("running configured command for account={account_name:?} mailbox={mailbox_name:?}");
     let outcome = run_shell_command(
         &mailbox.on_notify,
-        config.log_command_output,
+        config.capture_command_output(),
         config.command_timeout(),
     )
     .await?;
@@ -143,6 +145,7 @@ async fn run_daemon(
     let notifier = Notifier::from_env(systemd_enabled);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut initial_receivers = Vec::new();
+    let mut task_handles = Vec::new();
 
     for account in config.accounts.clone() {
         for mailbox in account.mailboxes.clone() {
@@ -152,7 +155,7 @@ async fn run_daemon(
             let (event_tx, event_rx) = mpsc::channel(64);
             let executor: Arc<dyn CommandExecutor> = Arc::new(ShellCommandExecutor::new(
                 Arc::<str>::from(mailbox.on_notify.clone()),
-                config.log_command_output,
+                config.capture_command_output(),
                 config.command_timeout(),
             ));
             let debounce = mailbox.debounce(&config);
@@ -161,10 +164,11 @@ async fn run_daemon(
                 account.name.clone(),
                 mailbox.name.clone(),
                 debounce,
+                config.min_command_interval(),
                 executor,
                 Some(Arc::clone(&state)),
             );
-            spawn_command_runner(
+            task_handles.push(spawn_command_runner(
                 debounce_runner,
                 event_rx,
                 Arc::clone(&state),
@@ -172,11 +176,11 @@ async fn run_daemon(
                 account.name.clone(),
                 mailbox.name.clone(),
                 shutdown_rx.clone(),
-            );
+            ));
 
             let (ready_tx, ready_rx) = oneshot::channel();
             initial_receivers.push(ready_rx);
-            spawn_watcher(
+            task_handles.push(spawn_watcher(
                 account.clone(),
                 mailbox,
                 event_tx,
@@ -187,8 +191,11 @@ async fn run_daemon(
                 mailwake::imap::WatcherSettings {
                     idle_refresh: config.idle_refresh(),
                     auth_helper_timeout: config.auth_helper_timeout(),
+                    auth_helper_max_output_bytes: config.auth_helper_max_output_bytes(),
+                    connect_timeout: config.connect_timeout(),
+                    operation_timeout: config.imap_operation_timeout(),
                 },
-            );
+            ));
         }
     }
 
@@ -200,6 +207,11 @@ async fn run_daemon(
                 _ = wait_for_shutdown_signal() => {
                     let _ = shutdown_tx.send(true);
                     let _ = notifier.stopping();
+                    await_task_shutdown(
+                        task_handles,
+                        config.imap_operation_timeout() + Duration::from_secs(5),
+                    )
+                    .await;
                     return Ok(());
                 }
             }
@@ -227,6 +239,11 @@ async fn run_daemon(
     if let Err(error) = notifier.stopping() {
         warn!(%error, "failed to send systemd STOPPING notification");
     }
+    await_task_shutdown(
+        task_handles,
+        config.imap_operation_timeout() + Duration::from_secs(5),
+    )
+    .await;
     Ok(())
 }
 
@@ -238,7 +255,7 @@ fn spawn_command_runner(
     account_name: String,
     mailbox_name: String,
     shutdown: watch::Receiver<bool>,
-) {
+) -> JoinHandle<()> {
     let handle = tokio::spawn(runner.run(event_rx, shutdown));
     tokio::spawn(async move {
         match handle.await {
@@ -253,7 +270,7 @@ fn spawn_command_runner(
                 );
             }
         }
-    });
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -266,7 +283,7 @@ fn spawn_watcher(
     initial_ready: Option<oneshot::Sender<()>>,
     shutdown: watch::Receiver<bool>,
     settings: mailwake::imap::WatcherSettings,
-) {
+) -> JoinHandle<()> {
     let state_for_task = Arc::clone(&state);
     let account_name = account.name.clone();
     let mailbox_name = mailbox.name.clone();
@@ -293,7 +310,17 @@ fn spawn_watcher(
                 "IMAP watcher task crashed"
             );
         }
-    });
+    })
+}
+
+async fn await_task_shutdown(handles: Vec<JoinHandle<()>>, grace: Duration) {
+    for handle in handles {
+        match timeout(grace, handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => warn!(%error, "supervised task failed during shutdown"),
+            Err(_) => warn!("timed out waiting for supervised task shutdown"),
+        }
+    }
 }
 
 async fn wait_for_shutdown_signal() {

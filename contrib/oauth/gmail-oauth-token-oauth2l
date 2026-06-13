@@ -11,7 +11,7 @@
 #
 # mailwake config:
 #   auth = "xoauth2_cmd"
-#   xoauth2_cmd = "gmail-oauth-token"
+#   xoauth2_cmd = "/home/alice/.local/bin/gmail-oauth-token"
 
 set -eu
 

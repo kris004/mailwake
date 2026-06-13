@@ -3,13 +3,14 @@ use crate::config::{AccountConfig, MailboxConfig, SecretString};
 use crate::state::{RuntimeState, WatcherPhase};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use std::future::Future;
 use std::time::Duration;
 use std::{fmt, sync::Arc};
 use thiserror::Error;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 use tokio_native_tls::TlsConnector;
 use tracing::{debug, info, warn};
 
@@ -20,6 +21,9 @@ const MAX_BACKOFF: Duration = Duration::from_secs(300);
 pub struct WatcherSettings {
     pub idle_refresh: Duration,
     pub auth_helper_timeout: Duration,
+    pub auth_helper_max_output_bytes: usize,
+    pub connect_timeout: Duration,
+    pub operation_timeout: Duration,
 }
 
 trait ImapStream: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -42,6 +46,13 @@ pub enum ImapError {
     CommandRejected { command: &'static str },
     #[error("unexpected IMAP protocol response while {context}")]
     Protocol { context: &'static str },
+    #[error("{operation} timed out after {seconds} seconds")]
+    OperationTimedOut {
+        operation: &'static str,
+        seconds: u64,
+    },
+    #[error("{field} contains CR or LF characters and cannot be sent as an IMAP string")]
+    UnsafeImapString { field: &'static str },
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -122,22 +133,49 @@ async fn run_mailbox_once(
     shutdown: &mut watch::Receiver<bool>,
     settings: WatcherSettings,
 ) -> Result<RunEnd, ImapError> {
-    let credentials = auth::credentials_for(account, settings.auth_helper_timeout).await?;
-    let stream = connect(account).await?;
+    validate_imap_string("username", &account.username)?;
+    validate_imap_string("mailbox name", &mailbox.name)?;
+
+    let stream = connect(
+        account,
+        settings.connect_timeout,
+        settings.operation_timeout,
+    )
+    .await?;
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
     let mut tags = Tags::default();
 
-    read_greeting(&mut reader).await?;
-    authenticate(
-        &mut reader,
-        &mut write_half,
-        &mut tags,
-        &account.username,
-        credentials,
+    with_imap_timeout(
+        settings.operation_timeout,
+        "IMAP greeting",
+        read_greeting(&mut reader),
     )
     .await?;
-    select_mailbox(&mut reader, &mut write_half, &mut tags, &mailbox.name).await?;
+    let credentials = auth::credentials_for(
+        account,
+        settings.auth_helper_timeout,
+        settings.auth_helper_max_output_bytes,
+    )
+    .await?;
+    with_imap_timeout(
+        settings.operation_timeout,
+        "IMAP authentication",
+        authenticate(
+            &mut reader,
+            &mut write_half,
+            &mut tags,
+            &account.username,
+            credentials,
+        ),
+    )
+    .await?;
+    with_imap_timeout(
+        settings.operation_timeout,
+        "SELECT",
+        select_mailbox(&mut reader, &mut write_half, &mut tags, &mailbox.name),
+    )
+    .await?;
 
     info!(
         account = %account.name,
@@ -156,14 +194,19 @@ async fn run_mailbox_once(
         initial_ready,
         established,
         shutdown,
-        settings.idle_refresh,
+        settings,
     )
     .await
 }
 
-async fn connect(account: &AccountConfig) -> Result<BoxedImapStream, ImapError> {
+async fn connect(
+    account: &AccountConfig,
+    connect_timeout: Duration,
+    operation_timeout: Duration,
+) -> Result<BoxedImapStream, ImapError> {
     let address = (account.host.as_str(), account.port());
-    let tcp = TcpStream::connect(address).await?;
+    let tcp =
+        with_imap_timeout(connect_timeout, "TCP connect", TcpStream::connect(address)).await?;
     if account.insecure_plaintext {
         return Ok(Box::new(tcp));
     }
@@ -173,7 +216,12 @@ async fn connect(account: &AccountConfig) -> Result<BoxedImapStream, ImapError> 
         builder.danger_accept_invalid_certs(true);
     }
     let connector = TlsConnector::from(builder.build()?);
-    let tls = connector.connect(&account.host, tcp).await?;
+    let tls = with_imap_timeout(
+        operation_timeout,
+        "TLS handshake",
+        connector.connect(&account.host, tcp),
+    )
+    .await?;
     Ok(Box::new(tls))
 }
 
@@ -269,6 +317,8 @@ where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    validate_imap_string("username", username)?;
+    validate_imap_string("password", password.expose_secret())?;
     let tag = tags.next();
     let command = format!(
         "{tag} LOGIN {} {}\r\n",
@@ -294,6 +344,7 @@ where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    validate_imap_string("mailbox name", mailbox)?;
     let tag = tags.next();
     let command = format!("{tag} SELECT {}\r\n", quote_imap(mailbox));
     write_raw(writer, command.as_bytes()).await?;
@@ -313,7 +364,7 @@ async fn idle_forever<R, W>(
     initial_ready: &mut Option<oneshot::Sender<()>>,
     established: &mut bool,
     shutdown: &mut watch::Receiver<bool>,
-    idle_refresh: Duration,
+    settings: WatcherSettings,
 ) -> Result<RunEnd, ImapError>
 where
     R: AsyncBufRead + Unpin,
@@ -321,8 +372,19 @@ where
 {
     loop {
         let tag = tags.next();
-        write_raw(writer, format!("{tag} IDLE\r\n").as_bytes()).await?;
-        wait_idle_continuation(reader, &tag).await?;
+        let idle_command = format!("{tag} IDLE\r\n");
+        with_imap_timeout(
+            settings.operation_timeout,
+            "IDLE command",
+            write_raw(writer, idle_command.as_bytes()),
+        )
+        .await?;
+        with_imap_timeout(
+            settings.operation_timeout,
+            "IDLE continuation",
+            wait_idle_continuation(reader, &tag),
+        )
+        .await?;
         state.mark_watcher(watcher_id, WatcherPhase::Idling);
         if !*established {
             *established = true;
@@ -336,15 +398,14 @@ where
             "IMAP IDLE started"
         );
 
-        let refresh = sleep(idle_refresh);
+        let refresh = sleep(settings.idle_refresh);
         tokio::pin!(refresh);
         loop {
             let mut line = String::new();
             tokio::select! {
                 changed = shutdown.changed() => {
                     if changed.is_ok() && *shutdown.borrow() {
-                        let _ = write_raw(writer, b"DONE\r\n").await;
-                        let _ = wait_tagged(reader, &tag, "IDLE").await;
+                        let _ = finish_idle(reader, writer, &tag, settings.operation_timeout).await;
                         return Ok(RunEnd::Shutdown);
                     }
                 }
@@ -354,8 +415,7 @@ where
                         mailbox = %mailbox.name,
                         "IMAP IDLE refresh"
                     );
-                    write_raw(writer, b"DONE\r\n").await?;
-                    wait_tagged(reader, &tag, "IDLE").await?;
+                    finish_idle(reader, writer, &tag, settings.operation_timeout).await?;
                     state.mark_watcher(watcher_id, WatcherPhase::Idling);
                     break;
                 }
@@ -436,6 +496,30 @@ where
     }
 }
 
+async fn finish_idle<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    tag: &str,
+    operation_timeout: Duration,
+) -> Result<(), ImapError>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    with_imap_timeout(
+        operation_timeout,
+        "IDLE DONE",
+        write_raw(writer, b"DONE\r\n"),
+    )
+    .await?;
+    with_imap_timeout(
+        operation_timeout,
+        "IDLE tagged response",
+        wait_tagged(reader, tag, "IDLE"),
+    )
+    .await
+}
+
 async fn read_line<R>(reader: &mut R) -> Result<String, ImapError>
 where
     R: AsyncBufRead + Unpin,
@@ -454,6 +538,31 @@ where
 {
     writer.write_all(bytes).await?;
     writer.flush().await?;
+    Ok(())
+}
+
+async fn with_imap_timeout<F, T, E>(
+    duration: Duration,
+    operation: &'static str,
+    future: F,
+) -> Result<T, ImapError>
+where
+    F: Future<Output = Result<T, E>>,
+    E: Into<ImapError>,
+{
+    match timeout(duration, future).await {
+        Ok(result) => result.map_err(Into::into),
+        Err(_) => Err(ImapError::OperationTimedOut {
+            operation,
+            seconds: duration.as_secs(),
+        }),
+    }
+}
+
+fn validate_imap_string(field: &'static str, value: &str) -> Result<(), ImapError> {
+    if value.chars().any(|ch| matches!(ch, '\r' | '\n')) {
+        return Err(ImapError::UnsafeImapString { field });
+    }
     Ok(())
 }
 
@@ -564,5 +673,13 @@ mod tests {
         assert!(is_mailbox_change("* 2 EXPUNGE"));
         assert!(!is_mailbox_change("* OK Still here"));
         assert!(!is_mailbox_change("A0001 OK IDLE completed"));
+    }
+
+    #[test]
+    fn rejects_crlf_in_imap_strings() {
+        assert!(validate_imap_string("username", "me@example.com").is_ok());
+        assert!(validate_imap_string("username", "me\n@example.com").is_err());
+        assert!(validate_imap_string("mailbox name", "IN\rBOX").is_err());
+        assert!(validate_imap_string("password", "secret\nnext").is_err());
     }
 }

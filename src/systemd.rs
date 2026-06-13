@@ -21,11 +21,16 @@ impl Notifier {
             return Self::disabled();
         }
         let socket = env::var_os("NOTIFY_SOCKET");
-        let watchdog_interval = env::var("WATCHDOG_USEC")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|usec| *usec > 0)
-            .map(Duration::from_micros);
+        let watchdog_interval =
+            if watchdog_pid_allows(env::var("WATCHDOG_PID").ok().as_deref(), std::process::id()) {
+                env::var("WATCHDOG_USEC")
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .filter(|usec| *usec > 0)
+                    .map(Duration::from_micros)
+            } else {
+                None
+            };
         Self {
             socket,
             watchdog_interval,
@@ -123,6 +128,13 @@ fn sanitize_field(value: &str) -> String {
     value.replace(['\r', '\n'], " ")
 }
 
+fn watchdog_pid_allows(value: Option<&str>, current_pid: u32) -> bool {
+    match value {
+        None => true,
+        Some(value) => value.parse::<u32>().is_ok_and(|pid| pid == current_pid),
+    }
+}
+
 fn send_datagram(socket: &OsStr, message: &[u8]) -> io::Result<()> {
     let socket_bytes = socket.as_bytes();
     if socket_bytes.is_empty() {
@@ -213,5 +225,13 @@ mod tests {
     #[test]
     fn status_fields_are_single_line() {
         assert_eq!(sanitize_field("one\ntwo\rthree"), "one two three");
+    }
+
+    #[test]
+    fn watchdog_pid_must_match_if_present() {
+        assert!(watchdog_pid_allows(None, 42));
+        assert!(watchdog_pid_allows(Some("42"), 42));
+        assert!(!watchdog_pid_allows(Some("43"), 42));
+        assert!(!watchdog_pid_allows(Some("not-a-pid"), 42));
     }
 }

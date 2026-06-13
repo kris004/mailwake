@@ -1,7 +1,7 @@
 use crate::command::{CommandExecutor, CommandOutcome};
 use crate::state::{CommandRunnerPhase, RuntimeState};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 use tokio::time::sleep;
 use tracing::{error, info, warn};
@@ -10,6 +10,7 @@ pub struct DebounceRunner {
     account: String,
     mailbox: String,
     debounce: Duration,
+    cooldown: Duration,
     executor: Arc<dyn CommandExecutor>,
     state: Option<Arc<RuntimeState>>,
     runner_id: String,
@@ -20,6 +21,7 @@ impl DebounceRunner {
         account: impl Into<String>,
         mailbox: impl Into<String>,
         debounce: Duration,
+        cooldown: Duration,
         executor: Arc<dyn CommandExecutor>,
         state: Option<Arc<RuntimeState>>,
     ) -> Self {
@@ -30,6 +32,7 @@ impl DebounceRunner {
             account,
             mailbox,
             debounce,
+            cooldown,
             executor,
             state,
             runner_id,
@@ -38,6 +41,7 @@ impl DebounceRunner {
 
     pub async fn run(self, mut events: mpsc::Receiver<()>, mut shutdown: watch::Receiver<bool>) {
         self.mark_runner(CommandRunnerPhase::Idle);
+        let mut last_command_finished = None;
         loop {
             let got_event = tokio::select! {
                 changed = shutdown.changed() => {
@@ -60,7 +64,14 @@ impl DebounceRunner {
                     return;
                 }
                 self.drain_events(&mut events);
-                self.run_once().await;
+                if !self
+                    .wait_for_cooldown(last_command_finished, &mut events, &mut shutdown)
+                    .await
+                {
+                    return;
+                }
+                self.run_once(shutdown.clone()).await;
+                last_command_finished = Some(Instant::now());
 
                 if self.drain_events(&mut events) {
                     continue;
@@ -91,7 +102,31 @@ impl DebounceRunner {
         saw_event
     }
 
-    async fn run_once(&self) {
+    async fn wait_for_cooldown(
+        &self,
+        last_command_finished: Option<Instant>,
+        events: &mut mpsc::Receiver<()>,
+        shutdown: &mut watch::Receiver<bool>,
+    ) -> bool {
+        let Some(last_command_finished) = last_command_finished else {
+            return true;
+        };
+        if self.cooldown.is_zero() {
+            return true;
+        }
+        let elapsed = last_command_finished.elapsed();
+        if elapsed >= self.cooldown {
+            return true;
+        }
+        self.mark_runner(CommandRunnerPhase::CoolingDown);
+        if !sleep_or_shutdown(self.cooldown - elapsed, shutdown).await {
+            return false;
+        }
+        self.drain_events(events);
+        true
+    }
+
+    async fn run_once(&self, shutdown: watch::Receiver<bool>) {
         info!(
             account = %self.account,
             mailbox = %self.mailbox,
@@ -100,7 +135,7 @@ impl DebounceRunner {
         if let Some(state) = &self.state {
             state.mark_command_started(&self.runner_id);
         }
-        match self.executor.run().await {
+        match self.executor.run(shutdown).await {
             Ok(outcome) => self.record_outcome(outcome),
             Err(error) => {
                 if let Some(state) = &self.state {
@@ -178,7 +213,7 @@ mod tests {
     }
 
     impl CommandExecutor for TestExecutor {
-        fn run(&self) -> CommandRunFuture {
+        fn run(&self, _shutdown: watch::Receiver<bool>) -> CommandRunFuture {
             let this = self.clone();
             Box::pin(async move {
                 this.calls.fetch_add(1, Ordering::SeqCst);
@@ -191,6 +226,7 @@ mod tests {
                     code: Some(if this.success { 0 } else { 1 }),
                     signal: None,
                     timed_out: false,
+                    cancelled: false,
                     timeout: None,
                 })
             })
@@ -216,6 +252,7 @@ mod tests {
             "gmail",
             "INBOX",
             Duration::from_millis(30),
+            Duration::ZERO,
             Arc::new(exec.clone()),
             None,
         );
@@ -241,6 +278,7 @@ mod tests {
             "gmail",
             "INBOX",
             Duration::from_millis(5),
+            Duration::ZERO,
             Arc::new(exec.clone()),
             None,
         );
@@ -266,6 +304,7 @@ mod tests {
             "gmail",
             "INBOX",
             Duration::from_millis(10),
+            Duration::ZERO,
             Arc::new(exec.clone()),
             None,
         );
@@ -281,6 +320,35 @@ mod tests {
         tx.send(()).await.unwrap();
         wait_for_calls(&exec.calls, 2).await;
         sleep(Duration::from_millis(40)).await;
+        assert_eq!(exec.calls.load(Ordering::SeqCst), 2);
+
+        shutdown_tx.send(true).unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cooldown_coalesces_events_after_command() {
+        let exec = TestExecutor::new(Duration::ZERO);
+        let (tx, rx) = mpsc::channel(16);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let runner = DebounceRunner::new(
+            "gmail",
+            "INBOX",
+            Duration::from_millis(5),
+            Duration::from_millis(80),
+            Arc::new(exec.clone()),
+            None,
+        );
+        let task = tokio::spawn(runner.run(rx, shutdown_rx));
+
+        tx.send(()).await.unwrap();
+        wait_for_calls(&exec.calls, 1).await;
+        tx.send(()).await.unwrap();
+        tx.send(()).await.unwrap();
+        sleep(Duration::from_millis(30)).await;
+        assert_eq!(exec.calls.load(Ordering::SeqCst), 1);
+        wait_for_calls(&exec.calls, 2).await;
+        sleep(Duration::from_millis(30)).await;
         assert_eq!(exec.calls.load(Ordering::SeqCst), 2);
 
         shutdown_tx.send(true).unwrap();

@@ -1,43 +1,45 @@
 use std::future::Future;
 use std::pin::Pin;
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::process::Command;
-use tokio::time::timeout;
+use tokio::sync::watch;
 use tracing::debug;
+
+use crate::process::{ShellProcessError, ShellRun, run_shell_process};
 
 pub type CommandRunFuture = Pin<Box<dyn Future<Output = CommandRunResult> + Send>>;
 pub type CommandRunResult = Result<CommandOutcome, CommandError>;
 
 pub trait CommandExecutor: Send + Sync {
-    fn run(&self) -> CommandRunFuture;
+    fn run(&self, shutdown: watch::Receiver<bool>) -> CommandRunFuture;
 }
 
 #[derive(Clone)]
 pub struct ShellCommandExecutor {
     command: Arc<str>,
-    log_output: bool,
+    capture_output: bool,
     timeout: Duration,
 }
 
 impl ShellCommandExecutor {
-    pub fn new(command: impl Into<Arc<str>>, log_output: bool, timeout: Duration) -> Self {
+    pub fn new(command: impl Into<Arc<str>>, capture_output: bool, timeout: Duration) -> Self {
         Self {
             command: command.into(),
-            log_output,
+            capture_output,
             timeout,
         }
     }
 }
 
 impl CommandExecutor for ShellCommandExecutor {
-    fn run(&self) -> CommandRunFuture {
+    fn run(&self, shutdown: watch::Receiver<bool>) -> CommandRunFuture {
         let command = Arc::clone(&self.command);
-        let log_output = self.log_output;
+        let capture_output = self.capture_output;
         let timeout = self.timeout;
-        Box::pin(async move { run_shell_command(&command, log_output, timeout).await })
+        Box::pin(async move {
+            run_shell_command_with_shutdown(&command, capture_output, timeout, shutdown).await
+        })
     }
 }
 
@@ -47,6 +49,7 @@ pub struct CommandOutcome {
     pub code: Option<i32>,
     pub signal: Option<i32>,
     pub timed_out: bool,
+    pub cancelled: bool,
     pub timeout: Option<Duration>,
 }
 
@@ -57,7 +60,19 @@ impl CommandOutcome {
             code: None,
             signal: None,
             timed_out: true,
+            cancelled: false,
             timeout: Some(timeout),
+        }
+    }
+
+    pub fn cancelled() -> Self {
+        Self {
+            success: false,
+            code: None,
+            signal: None,
+            timed_out: false,
+            cancelled: true,
+            timeout: None,
         }
     }
 
@@ -65,6 +80,9 @@ impl CommandOutcome {
         if self.timed_out {
             let seconds = self.timeout.unwrap_or_default().as_secs();
             return format!("timed out after {seconds} seconds");
+        }
+        if self.cancelled {
+            return "cancelled by shutdown".to_string();
         }
         if let Some(code) = self.code {
             return format!("exit status {code}");
@@ -91,6 +109,7 @@ impl From<std::process::ExitStatus> for CommandOutcome {
             code: status.code(),
             signal,
             timed_out: false,
+            cancelled: false,
             timeout: None,
         }
     }
@@ -108,50 +127,81 @@ pub enum CommandError {
         #[source]
         source: std::io::Error,
     },
+    #[error("command output could not be collected: {source}")]
+    Output {
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 pub async fn run_shell_command(
     command: &str,
-    log_output: bool,
+    capture_output: bool,
     command_timeout: Duration,
 ) -> CommandRunResult {
-    let mut process = Command::new("sh");
-    process
-        .arg("-c")
-        .arg(command)
-        .stdin(Stdio::null())
-        .kill_on_drop(true);
+    run_shell_command_inner(command, capture_output, command_timeout, None).await
+}
 
-    if log_output {
-        process.stdout(Stdio::piped()).stderr(Stdio::piped());
-    } else {
-        process.stdout(Stdio::null()).stderr(Stdio::null());
+pub async fn run_shell_command_with_shutdown(
+    command: &str,
+    capture_output: bool,
+    command_timeout: Duration,
+    shutdown: watch::Receiver<bool>,
+) -> CommandRunResult {
+    run_shell_command_inner(command, capture_output, command_timeout, Some(shutdown)).await
+}
+
+async fn run_shell_command_inner(
+    command: &str,
+    capture_output: bool,
+    command_timeout: Duration,
+    shutdown: Option<watch::Receiver<bool>>,
+) -> CommandRunResult {
+    match run_shell_process(
+        command,
+        capture_output,
+        capture_output,
+        command_timeout,
+        None,
+        shutdown,
+    )
+    .await
+    .map_err(CommandError::from)?
+    {
+        ShellRun::Completed(output) => {
+            if capture_output {
+                debug!(
+                    stdout_bytes = output.stdout.len(),
+                    stderr_bytes = output.stderr.len(),
+                    "command output captured by explicit debug option"
+                );
+            }
+            Ok(output.status.into())
+        }
+        ShellRun::TimedOut => Ok(CommandOutcome::timed_out(command_timeout)),
+        ShellRun::Cancelled => Ok(CommandOutcome::cancelled()),
+        ShellRun::OutputLimitExceeded(_) => {
+            unreachable!("notification commands have no output cap")
+        }
     }
+}
 
-    let child = process
-        .spawn()
-        .map_err(|source| CommandError::Start { source })?;
-    // If the timeout fires, dropping the wait future drops the child handle;
-    // kill_on_drop above kills the command child before we report timeout.
-    let output = match timeout(command_timeout, child.wait_with_output()).await {
-        Ok(result) => result.map_err(|source| CommandError::Wait { source })?,
-        Err(_) => return Ok(CommandOutcome::timed_out(command_timeout)),
-    };
-
-    if log_output {
-        debug!(
-            stdout_bytes = output.stdout.len(),
-            stderr_bytes = output.stderr.len(),
-            "command output captured by explicit debug option"
-        );
+impl From<ShellProcessError> for CommandError {
+    fn from(error: ShellProcessError) -> Self {
+        match error {
+            ShellProcessError::Start { source } => Self::Start { source },
+            ShellProcessError::Wait { source } => Self::Wait { source },
+            ShellProcessError::Output { source } => Self::Output { source },
+        }
     }
-
-    Ok(output.status.into())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::Path;
+    use tokio::time::sleep;
 
     #[tokio::test]
     async fn command_success_is_reported() {
@@ -187,5 +237,84 @@ mod tests {
         let text = outcome.description();
         assert!(text.contains("timed out"));
         assert!(!text.contains("super-secret"));
+    }
+
+    #[tokio::test]
+    async fn command_timeout_kills_child_process_tree() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("sleep.pid");
+        let command = format!(
+            "sleep 30 & printf '%s\\n' \"$!\" > {}; wait",
+            shell_quote(&pid_file)
+        );
+        let outcome = run_shell_command(&command, false, Duration::from_millis(200))
+            .await
+            .expect("timeout should be reported as an outcome");
+        assert!(outcome.timed_out);
+
+        let pid = read_pid_file(&pid_file).await;
+        assert_pid_exits(pid).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_running_command_process_tree() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("sleep.pid");
+        let command = format!(
+            "sleep 30 & printf '%s\\n' \"$!\" > {}; wait",
+            shell_quote(&pid_file)
+        );
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            run_shell_command_with_shutdown(&command, false, Duration::from_secs(30), shutdown_rx)
+                .await
+        });
+
+        let pid = read_pid_file(&pid_file).await;
+        shutdown_tx.send(true).unwrap();
+        let outcome = task
+            .await
+            .expect("command task should not panic")
+            .expect("shutdown should be reported as an outcome");
+        assert!(outcome.cancelled);
+        assert_pid_exits(pid).await;
+    }
+
+    fn shell_quote(path: &Path) -> String {
+        let value = path.to_string_lossy();
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+
+    async fn read_pid_file(path: &Path) -> libc::pid_t {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Ok(contents) = fs::read_to_string(path) {
+                    if let Ok(pid) = contents.trim().parse::<libc::pid_t>() {
+                        return pid;
+                    }
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("sleep pid file was not written")
+    }
+
+    async fn assert_pid_exits(pid: libc::pid_t) {
+        tokio::time::timeout(Duration::from_secs(3), async move {
+            while process_exists(pid) {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("timed-out command left a child process running");
+    }
+
+    fn process_exists(pid: libc::pid_t) -> bool {
+        let result = unsafe { libc::kill(pid, 0) };
+        if result == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
     }
 }

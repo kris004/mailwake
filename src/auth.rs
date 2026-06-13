@@ -1,13 +1,11 @@
 use crate::config::{AccountConfig, AuthMethod, Config, SecretString};
+use crate::process::{ShellProcessError, ShellRun, run_shell_process};
 use std::env;
 use std::fmt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::process::Command;
-use tokio::time::timeout;
 
 #[derive(Clone)]
 pub enum Credentials {
@@ -26,8 +24,6 @@ impl fmt::Debug for Credentials {
 
 #[derive(Debug, Error)]
 pub enum AuthError {
-    #[error("auth helper command has unsupported syntax")]
-    InvalidHelperSyntax,
     #[error("auth helper executable {0:?} was not found")]
     HelperNotFound(String),
     #[error("auth helper could not be started: {source}")]
@@ -39,6 +35,8 @@ pub enum AuthError {
     HelperFailed { status: String },
     #[error("auth helper timed out after {seconds} seconds")]
     HelperTimedOut { seconds: u64 },
+    #[error("auth helper wrote more than {limit} bytes to stdout")]
+    HelperOutputTooLarge { limit: usize },
     #[error("auth helper wrote non-UTF-8 output")]
     HelperOutputUtf8,
     #[error("auth helper returned an empty secret")]
@@ -81,6 +79,7 @@ pub fn validate_auth_helpers(config: &Config) -> Result<(), AuthError> {
 pub async fn credentials_for(
     account: &AccountConfig,
     helper_timeout: Duration,
+    helper_max_output_bytes: usize,
 ) -> Result<Credentials, AuthError> {
     match account.auth {
         AuthMethod::Xoauth2Cmd => {
@@ -92,7 +91,7 @@ pub async fn credentials_for(
                         account: account.name.clone(),
                         method: account.auth,
                     })?;
-            let token = run_secret_command(cmd, helper_timeout).await?;
+            let token = run_secret_command(cmd, helper_timeout, helper_max_output_bytes).await?;
             Ok(Credentials::Xoauth2 { token })
         }
         AuthMethod::PasswordCmd => {
@@ -104,7 +103,7 @@ pub async fn credentials_for(
                         account: account.name.clone(),
                         method: account.auth,
                     })?;
-            let password = run_secret_command(cmd, helper_timeout).await?;
+            let password = run_secret_command(cmd, helper_timeout, helper_max_output_bytes).await?;
             Ok(Credentials::Password { password })
         }
         AuthMethod::Password => {
@@ -123,26 +122,29 @@ pub async fn credentials_for(
 pub async fn run_secret_command(
     command: &str,
     helper_timeout: Duration,
+    helper_max_output_bytes: usize,
 ) -> Result<SecretString, AuthError> {
-    let mut process = Command::new("sh");
-    process
-        .arg("-c")
-        .arg(command)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-
-    let child = process
-        .spawn()
-        .map_err(|source| AuthError::HelperStart { source })?;
-    // If the timeout fires, dropping the wait future drops the child handle;
-    // kill_on_drop above kills the helper without logging its stdout.
-    let output = match timeout(helper_timeout, child.wait_with_output()).await {
-        Ok(result) => result.map_err(|source| AuthError::HelperStart { source })?,
-        Err(_) => {
+    let output = match run_shell_process(
+        command,
+        true,
+        false,
+        helper_timeout,
+        Some(helper_max_output_bytes),
+        None,
+    )
+    .await
+    .map_err(AuthError::from)?
+    {
+        ShellRun::Completed(output) => output,
+        ShellRun::TimedOut => {
             return Err(AuthError::HelperTimedOut {
                 seconds: helper_timeout.as_secs(),
+            });
+        }
+        ShellRun::Cancelled => unreachable!("auth helpers are not run with shutdown cancellation"),
+        ShellRun::OutputLimitExceeded(exceeded) => {
+            return Err(AuthError::HelperOutputTooLarge {
+                limit: exceeded.limit,
             });
         }
     };
@@ -161,7 +163,20 @@ pub async fn run_secret_command(
     Ok(SecretString::new(secret))
 }
 
+impl From<ShellProcessError> for AuthError {
+    fn from(error: ShellProcessError) -> Self {
+        match error {
+            ShellProcessError::Start { source }
+            | ShellProcessError::Wait { source }
+            | ShellProcessError::Output { source } => Self::HelperStart { source },
+        }
+    }
+}
+
 pub fn check_helper_exists_if_practical(command: &str) -> Result<(), AuthError> {
+    if contains_shell_syntax(command) {
+        return Ok(());
+    }
     let words = match shell_words::split(command) {
         Ok(words) => words,
         Err(_) => return Ok(()),
@@ -169,6 +184,9 @@ pub fn check_helper_exists_if_practical(command: &str) -> Result<(), AuthError> 
     let Some(program) = first_program_word(&words) else {
         return Ok(());
     };
+    if contains_shell_syntax(program) {
+        return Ok(());
+    }
     if is_shell_builtin(program) {
         return Ok(());
     }
@@ -183,6 +201,15 @@ pub fn check_helper_exists_if_practical(command: &str) -> Result<(), AuthError> 
         return Ok(());
     }
     Err(AuthError::HelperNotFound(program.to_string()))
+}
+
+fn contains_shell_syntax(command: &str) -> bool {
+    command.chars().any(|ch| {
+        matches!(
+            ch,
+            '\r' | '\n' | '~' | '|' | '&' | ';' | '<' | '>' | '(' | ')' | '$' | '`' | '*' | '?'
+        )
+    })
 }
 
 fn first_program_word(words: &[String]) -> Option<&str> {
@@ -277,28 +304,45 @@ fn describe_status(status: std::process::ExitStatus) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::Path;
+    use tokio::time::sleep;
+
+    const MAX_SECRET_OUTPUT: usize = 65_536;
 
     #[tokio::test]
     async fn password_cmd_output_trims_trailing_newlines() {
-        let secret = run_secret_command("printf 'password\\n\\n'", Duration::from_secs(1))
-            .await
-            .expect("helper should succeed");
+        let secret = run_secret_command(
+            "printf 'password\\n\\n'",
+            Duration::from_secs(1),
+            MAX_SECRET_OUTPUT,
+        )
+        .await
+        .expect("helper should succeed");
         assert_eq!(secret.expose_secret(), "password");
     }
 
     #[tokio::test]
     async fn xoauth2_cmd_output_trims_trailing_newlines() {
-        let secret = run_secret_command("printf 'ya29.token\\r\\n'", Duration::from_secs(1))
-            .await
-            .expect("helper should succeed");
+        let secret = run_secret_command(
+            "printf 'ya29.token\\r\\n'",
+            Duration::from_secs(1),
+            MAX_SECRET_OUTPUT,
+        )
+        .await
+        .expect("helper should succeed");
         assert_eq!(secret.expose_secret(), "ya29.token");
     }
 
     #[tokio::test]
     async fn auth_helper_errors_do_not_include_output() {
-        let err = run_secret_command("printf 'super-secret'; exit 42", Duration::from_secs(1))
-            .await
-            .expect_err("helper should fail");
+        let err = run_secret_command(
+            "printf 'super-secret'; exit 42",
+            Duration::from_secs(1),
+            MAX_SECRET_OUTPUT,
+        )
+        .await
+        .expect_err("helper should fail");
         let text = err.to_string();
         assert!(text.contains("exit status 42"));
         assert!(!text.contains("super-secret"));
@@ -306,12 +350,52 @@ mod tests {
 
     #[tokio::test]
     async fn auth_helper_timeout_does_not_include_output() {
-        let err = run_secret_command("printf 'super-secret'; sleep 5", Duration::from_millis(50))
-            .await
-            .expect_err("helper should time out");
+        let err = run_secret_command(
+            "printf 'super-secret'; sleep 5",
+            Duration::from_millis(50),
+            MAX_SECRET_OUTPUT,
+        )
+        .await
+        .expect_err("helper should time out");
         let text = err.to_string();
         assert!(text.contains("timed out"));
         assert!(!text.contains("super-secret"));
+    }
+
+    #[tokio::test]
+    async fn auth_helper_timeout_kills_child_process_tree() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("sleep.pid");
+        let command = format!(
+            "sleep 30 & printf '%s\\n' \"$!\" > {}; wait",
+            shell_quote(&pid_file)
+        );
+        let err = run_secret_command(&command, Duration::from_millis(200), MAX_SECRET_OUTPUT)
+            .await
+            .expect_err("helper should time out");
+        assert!(err.to_string().contains("timed out"));
+
+        let pid = read_pid_file(&pid_file).await;
+        assert_pid_exits(pid).await;
+    }
+
+    #[tokio::test]
+    async fn auth_helper_output_cap_kills_child_process_tree_without_leaking_output() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("sleep.pid");
+        let command = format!(
+            "sleep 30 & printf '%s\\n' \"$!\" > {}; yes super-secret",
+            shell_quote(&pid_file)
+        );
+        let err = run_secret_command(&command, Duration::from_secs(5), 1024)
+            .await
+            .expect_err("helper output should exceed cap");
+        let text = err.to_string();
+        assert!(text.contains("more than 1024 bytes"));
+        assert!(!text.contains("super-secret"));
+
+        let pid = read_pid_file(&pid_file).await;
+        assert_pid_exits(pid).await;
     }
 
     #[test]
@@ -346,6 +430,21 @@ on_notify = "echo sync"
     }
 
     #[test]
+    fn helper_path_validation_skips_complex_shell_commands() {
+        for command in [
+            "~/bin/gmail-oauth-token",
+            "definitely-not-a-mailwake-helper | cat",
+            "definitely-not-a-mailwake-helper && cat",
+            "definitely-not-a-mailwake-helper > /tmp/token",
+            "definitely-not-a-mailwake-helper; cat",
+            "TOKEN=$(definitely-not-a-mailwake-helper) printf '%s' \"$TOKEN\"",
+        ] {
+            check_helper_exists_if_practical(command)
+                .unwrap_or_else(|error| panic!("{command:?} should not hard-fail: {error}"));
+        }
+    }
+
+    #[test]
     fn credential_debug_redacts_secret() {
         let creds = Credentials::Xoauth2 {
             token: SecretString::new("ya29.secret"),
@@ -353,5 +452,43 @@ on_notify = "echo sync"
         let debug = format!("{creds:?}");
         assert!(!debug.contains("ya29.secret"));
         assert!(debug.contains("[REDACTED]"));
+    }
+
+    fn shell_quote(path: &Path) -> String {
+        let value = path.to_string_lossy();
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+
+    async fn read_pid_file(path: &Path) -> libc::pid_t {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Ok(contents) = fs::read_to_string(path) {
+                    if let Ok(pid) = contents.trim().parse::<libc::pid_t>() {
+                        return pid;
+                    }
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("sleep pid file was not written")
+    }
+
+    async fn assert_pid_exits(pid: libc::pid_t) {
+        tokio::time::timeout(Duration::from_secs(3), async move {
+            while process_exists(pid) {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("timed-out auth helper left a child process running");
+    }
+
+    fn process_exists(pid: libc::pid_t) -> bool {
+        let result = unsafe { libc::kill(pid, 0) };
+        if result == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
     }
 }
