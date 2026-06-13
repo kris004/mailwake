@@ -193,8 +193,22 @@ type = "imap_idle"
 account = "gmail"
 mailbox = "INBOX"
 on_event = "remote-sync"
+run_on_startup = false
 debounce_seconds = 10
 ```
+
+Top-level sources can also set `run_on_startup = true` to queue their normal
+configured command once when the daemon starts. This is generic: `imap_idle`
+sources queue `on_event`, and `fs_state` sources queue `on_change`. Startup
+commands use the same command lanes, timeouts, cooldowns, and coalescing as
+event-triggered commands; commands in the same lane still do not overlap.
+
+`mailwake` reports `READY=1` after source tasks are supervised. After that,
+`run_on_startup` commands are released into the normal command system. For
+`fs_state` sources with `state_cmd`, the startup baseline is captured before
+the startup command runs. If that command changes watched paths, `fs_state`
+uses the same self-trigger suppression and rebaseline behavior as a normal
+source-owned command.
 
 ## `fs_state` sources
 
@@ -210,6 +224,7 @@ watch_paths = ["/home/alice/.mail/example/.notmuch"]
 recursive = false
 state_cmd = "cd /home/alice/.mail/example && notmuch count --lastmod"
 on_change = "local-push"
+run_on_startup = false
 debounce_seconds = 5
 max_debounce_seconds = 60
 ```

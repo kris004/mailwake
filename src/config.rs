@@ -155,6 +155,8 @@ pub struct ImapIdleSourceConfig {
     pub mailbox: String,
     pub on_event: String,
     #[serde(default)]
+    pub run_on_startup: bool,
+    #[serde(default)]
     pub debounce_seconds: Option<u64>,
 }
 
@@ -168,6 +170,8 @@ pub struct FsStateSourceConfig {
     #[serde(default)]
     pub state_cmd: Option<String>,
     pub on_change: String,
+    #[serde(default)]
+    pub run_on_startup: bool,
     #[serde(default)]
     pub debounce_seconds: Option<u64>,
     #[serde(default)]
@@ -1168,8 +1172,66 @@ on_change = "local-push"
             panic!("source should be fs_state");
         };
         assert!(!source.recursive());
+        assert!(!source.run_on_startup);
         assert_eq!(source.debounce(&config).as_secs(), 5);
         assert_eq!(source.max_debounce(&config).as_secs(), 60);
+    }
+
+    #[test]
+    fn run_on_startup_defaults_to_false_and_parses_for_sources() {
+        let config = Config::parse_str(
+            r#"
+[[accounts]]
+name = "gmail"
+host = "imap.gmail.com"
+username = "user@example.com"
+auth = "xoauth2_cmd"
+xoauth2_cmd = "gmail-oauth-token"
+
+[[commands]]
+name = "remote-sync"
+cmd = "echo remote"
+
+[[commands]]
+name = "local-push"
+cmd = "echo local"
+
+[[sources]]
+name = "remote-inbox"
+type = "imap_idle"
+account = "gmail"
+mailbox = "INBOX"
+on_event = "remote-sync"
+run_on_startup = true
+
+[[sources]]
+name = "local-state"
+type = "fs_state"
+watch_paths = ["/tmp/app-state"]
+on_change = "local-push"
+run_on_startup = true
+
+[[sources]]
+name = "local-state-default"
+type = "fs_state"
+watch_paths = ["/tmp/other-state"]
+on_change = "local-push"
+"#,
+        )
+        .expect("source startup trigger config should parse");
+
+        let SourceConfig::ImapIdle(imap) = &config.sources[0] else {
+            panic!("source should be imap_idle");
+        };
+        let SourceConfig::FsState(fs_state) = &config.sources[1] else {
+            panic!("source should be fs_state");
+        };
+        let SourceConfig::FsState(default_fs_state) = &config.sources[2] else {
+            panic!("source should be fs_state");
+        };
+        assert!(imap.run_on_startup);
+        assert!(fs_state.run_on_startup);
+        assert!(!default_fs_state.run_on_startup);
     }
 
     #[test]

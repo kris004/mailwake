@@ -21,7 +21,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, timeout};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -318,6 +318,7 @@ async fn run_daemon(
     ));
     let notifier = Notifier::from_env(systemd_enabled);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (startup_tx, startup_rx) = watch::channel(false);
     let mut initial_receivers: Vec<oneshot::Receiver<Result<(), String>>> = Vec::new();
     let mut task_handles = Vec::new();
     let mut command_senders = HashMap::new();
@@ -425,6 +426,14 @@ async fn run_daemon(
 
                 let (event_tx, event_rx) = mpsc::channel(64);
                 let trigger = command_trigger(&command_senders, &source.on_event, &watcher_id)?;
+                if source.run_on_startup {
+                    task_handles.push(spawn_startup_event(
+                        source.name.clone(),
+                        event_tx.clone(),
+                        startup_rx.clone(),
+                        shutdown_rx.clone(),
+                    ));
+                }
                 let debounce_runner = DebounceRunner::new(
                     source.account.clone(),
                     source.mailbox.clone(),
@@ -473,6 +482,7 @@ async fn run_daemon(
             }
             SourceConfig::FsState(source) => {
                 let watcher_id = source.name.clone();
+                let run_on_startup = source.run_on_startup;
                 state.register_watcher(watcher_id.clone());
                 let trigger = command_trigger(&command_senders, &source.on_change, &watcher_id)?;
                 let state_reader: Option<Arc<dyn StateReader>> =
@@ -506,6 +516,7 @@ async fn run_daemon(
                     state: Arc::clone(&state),
                     watcher_id,
                     initial_ready,
+                    startup: run_on_startup.then(|| startup_rx.clone()),
                     shutdown: shutdown_rx.clone(),
                 }));
             }
@@ -543,6 +554,7 @@ async fn run_daemon(
         warn!(%error, "failed to send systemd READY notification");
     }
     info!(%ready_status);
+    let _ = startup_tx.send(true);
 
     tokio::spawn(systemd::run_status_task(
         notifier.clone(),
@@ -582,6 +594,54 @@ fn spawn_debounce_runner(
                 %error,
                 "source debounce task crashed"
             );
+        }
+    })
+}
+
+fn spawn_startup_event(
+    source_name: String,
+    events: mpsc::Sender<()>,
+    mut startup: watch::Receiver<bool>,
+    mut shutdown: watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            if *startup.borrow() {
+                break;
+            }
+            tokio::select! {
+                changed = startup.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+                changed = shutdown.changed() => {
+                    if changed.is_ok() && *shutdown.borrow() {
+                        return;
+                    }
+                }
+            }
+        }
+
+        match events.try_send(()) {
+            Ok(()) => {
+                info!(
+                    source = %source_name,
+                    "queued run_on_startup source event"
+                );
+            }
+            Err(mpsc::error::TrySendError::Full(())) => {
+                debug!(
+                    source = %source_name,
+                    "source event queue is full; coalescing run_on_startup event"
+                );
+            }
+            Err(mpsc::error::TrySendError::Closed(())) => {
+                warn!(
+                    source = %source_name,
+                    "source event queue is closed before run_on_startup event"
+                );
+            }
         }
     })
 }
@@ -851,5 +911,33 @@ on_notify = "echo sync"
         assert_eq!(command, "echo sync");
         assert_eq!(timeout, Duration::from_secs(30));
         assert_eq!(description, "account=\"gmail\" mailbox=\"INBOX\"");
+    }
+
+    #[tokio::test]
+    async fn startup_event_is_queued_after_startup_signal() {
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        let (startup_tx, startup_rx) = watch::channel(false);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = spawn_startup_event(
+            "remote-inbox".to_string(),
+            event_tx,
+            startup_rx,
+            shutdown_rx,
+        );
+
+        assert!(
+            timeout(Duration::from_millis(20), event_rx.recv())
+                .await
+                .is_err()
+        );
+        startup_tx.send(true).unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(1), event_rx.recv())
+                .await
+                .expect("timed out waiting for startup event"),
+            Some(())
+        );
+        handle.await.unwrap();
+        drop(shutdown_tx);
     }
 }

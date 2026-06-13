@@ -176,7 +176,7 @@ impl FsStateRunner {
         mut events: mpsc::Receiver<FsStateEvent>,
         mut shutdown: watch::Receiver<bool>,
     ) {
-        self.run_inner(&mut events, &mut shutdown, None).await;
+        self.run_inner(&mut events, &mut shutdown, None, None).await;
     }
 
     pub async fn run_with_initial_ready(
@@ -184,8 +184,19 @@ impl FsStateRunner {
         mut events: mpsc::Receiver<FsStateEvent>,
         mut shutdown: watch::Receiver<bool>,
         initial_ready: oneshot::Sender<Result<(), String>>,
+        startup: Option<watch::Receiver<bool>>,
     ) {
-        self.run_inner(&mut events, &mut shutdown, Some(initial_ready))
+        self.run_inner(&mut events, &mut shutdown, Some(initial_ready), startup)
+            .await;
+    }
+
+    pub async fn run_with_startup_signal(
+        self,
+        mut events: mpsc::Receiver<FsStateEvent>,
+        mut shutdown: watch::Receiver<bool>,
+        startup: watch::Receiver<bool>,
+    ) {
+        self.run_inner(&mut events, &mut shutdown, None, Some(startup))
             .await;
     }
 
@@ -194,7 +205,9 @@ impl FsStateRunner {
         events: &mut mpsc::Receiver<FsStateEvent>,
         shutdown: &mut watch::Receiver<bool>,
         initial_ready: Option<oneshot::Sender<Result<(), String>>>,
+        startup: Option<watch::Receiver<bool>>,
     ) {
+        let mut startup = startup;
         let mut baseline = match &self.state_reader {
             Some(reader) => match reader.read(shutdown.clone()).await {
                 Ok(state) => {
@@ -231,50 +244,101 @@ impl FsStateRunner {
         };
 
         loop {
-            let Some(first_event_at) = self.recv_event(events, shutdown).await else {
+            let Some(work) = self.recv_work(events, &mut startup, shutdown).await else {
                 break;
             };
-            let mut batch = EventBatch::new(first_event_at);
+            match work {
+                SourceWork::FilesystemEvent(first_event_at) => {
+                    let mut batch = EventBatch::new(first_event_at);
 
-            loop {
-                match self
-                    .wait_for_settled_batch(events, shutdown, &mut batch)
-                    .await
-                {
-                    BatchWait::CheckNow => {}
-                    BatchWait::Shutdown | BatchWait::Closed => return,
+                    loop {
+                        match self
+                            .wait_for_settled_batch(events, shutdown, &mut batch)
+                            .await
+                        {
+                            BatchWait::CheckNow => {}
+                            BatchWait::Shutdown | BatchWait::Closed => return,
+                        }
+
+                        match self
+                            .process_dirty_batch(&mut baseline, events, shutdown)
+                            .await
+                        {
+                            OperationResult::Shutdown => return,
+                            OperationResult::Idle => break,
+                            OperationResult::DirtyAgain(dirty) => {
+                                batch = dirty.into_batch();
+                            }
+                        }
+                    }
                 }
-
-                match self
-                    .process_dirty_batch(&mut baseline, events, shutdown)
-                    .await
-                {
-                    OperationResult::Shutdown => return,
-                    OperationResult::Idle => break,
-                    OperationResult::DirtyAgain(dirty) => {
-                        batch = dirty.into_batch();
+                SourceWork::StartupTrigger => {
+                    let mut result = self
+                        .process_startup_trigger(&mut baseline, events, shutdown)
+                        .await;
+                    loop {
+                        match result {
+                            OperationResult::Shutdown => return,
+                            OperationResult::Idle => break,
+                            OperationResult::DirtyAgain(dirty) => {
+                                let mut batch = dirty.into_batch();
+                                match self
+                                    .wait_for_settled_batch(events, shutdown, &mut batch)
+                                    .await
+                                {
+                                    BatchWait::CheckNow => {}
+                                    BatchWait::Shutdown | BatchWait::Closed => return,
+                                }
+                                result = self
+                                    .process_dirty_batch(&mut baseline, events, shutdown)
+                                    .await;
+                            }
+                        }
                     }
                 }
             }
         }
     }
 
-    async fn recv_event(
+    async fn recv_work(
         &self,
         events: &mut mpsc::Receiver<FsStateEvent>,
+        startup: &mut Option<watch::Receiver<bool>>,
         shutdown: &mut watch::Receiver<bool>,
-    ) -> Option<Instant> {
+    ) -> Option<SourceWork> {
         loop {
+            if startup.as_ref().is_some_and(|receiver| *receiver.borrow()) {
+                *startup = None;
+                return Some(SourceWork::StartupTrigger);
+            }
+
             tokio::select! {
                 changed = shutdown.changed() => {
                     if changed.is_ok() && *shutdown.borrow() {
                         return None;
                     }
                 }
+                changed = async {
+                    match startup.as_mut() {
+                        Some(receiver) => receiver.changed().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match changed {
+                        Ok(()) if startup.as_ref().is_some_and(|receiver| *receiver.borrow()) => {
+                            *startup = None;
+                            return Some(SourceWork::StartupTrigger);
+                        }
+                        Ok(()) => {}
+                        Err(_) => {
+                            *startup = None;
+                        }
+                    }
+                }
                 event = events.recv() => {
                     let event = event?;
                     self.record_event(event);
-                    return Some(Instant::now());
+                    return Some(SourceWork::FilesystemEvent(Instant::now()));
                 }
             }
         }
@@ -393,6 +457,62 @@ impl FsStateRunner {
                     warn!(
                         source = %self.source,
                         "failed to rebaseline fs_state after command; keeping previous baseline"
+                    );
+                }
+                ReadOperation::Shutdown => return OperationResult::Shutdown,
+            }
+        }
+
+        dirty.into_operation_result()
+    }
+
+    async fn process_startup_trigger(
+        &self,
+        baseline: &mut Option<Baseline>,
+        events: &mut mpsc::Receiver<FsStateEvent>,
+        shutdown: &mut watch::Receiver<bool>,
+    ) -> OperationResult {
+        info!(
+            source = %self.source,
+            "fs_state run_on_startup trigger submitted"
+        );
+
+        let dirty = match self.trigger_collecting_events(events, shutdown).await {
+            TriggerOperation::Finished { report, dirty } => {
+                if report.success() {
+                    dirty
+                } else {
+                    return dirty.into_operation_result();
+                }
+            }
+            TriggerOperation::Shutdown => return OperationResult::Shutdown,
+            TriggerOperation::Failed { dirty } => return dirty.into_operation_result(),
+        };
+
+        if !self
+            .settle_after_own_command(events, shutdown, self.self_settle)
+            .await
+        {
+            return OperationResult::Shutdown;
+        }
+
+        if let Some(reader) = &self.state_reader {
+            match self
+                .read_state_collecting_events(reader, events, shutdown, true)
+                .await
+            {
+                ReadOperation::Read { state, .. } => {
+                    debug!(
+                        source = %self.source,
+                        state_bytes = state.len(),
+                        "rebaselined fs_state after run_on_startup command"
+                    );
+                    *baseline = Some(Baseline::Known(state));
+                }
+                ReadOperation::Failed { .. } => {
+                    warn!(
+                        source = %self.source,
+                        "failed to rebaseline fs_state after run_on_startup command; keeping previous baseline"
                     );
                 }
                 ReadOperation::Shutdown => return OperationResult::Shutdown,
@@ -611,6 +731,7 @@ pub struct FsStateWatcherTask {
     pub state: Arc<RuntimeState>,
     pub watcher_id: String,
     pub initial_ready: Option<oneshot::Sender<Result<(), String>>>,
+    pub startup: Option<watch::Receiver<bool>>,
     pub shutdown: watch::Receiver<bool>,
 }
 
@@ -623,6 +744,7 @@ pub async fn watch_fs_state_forever(task: FsStateWatcherTask) {
         state,
         watcher_id,
         initial_ready,
+        startup,
         shutdown,
     } = task;
 
@@ -643,7 +765,11 @@ pub async fn watch_fs_state_forever(task: FsStateWatcherTask) {
             );
             if let Some(sender) = initial_ready {
                 runner
-                    .run_with_initial_ready(events_rx, shutdown, sender)
+                    .run_with_initial_ready(events_rx, shutdown, sender, startup)
+                    .await;
+            } else if let Some(startup) = startup {
+                runner
+                    .run_with_startup_signal(events_rx, shutdown, startup)
                     .await;
             } else {
                 runner.run(events_rx, shutdown).await;
@@ -785,6 +911,11 @@ enum BatchWait {
     CheckNow,
     Shutdown,
     Closed,
+}
+
+enum SourceWork {
+    FilesystemEvent(Instant),
+    StartupTrigger,
 }
 
 enum ReadOperation {
@@ -1091,7 +1222,8 @@ mod tests {
             trigger,
             None,
         );
-        let handle = tokio::spawn(runner.run_with_initial_ready(events_rx, shutdown_rx, ready_tx));
+        let handle =
+            tokio::spawn(runner.run_with_initial_ready(events_rx, shutdown_rx, ready_tx, None));
 
         let ready = timeout(Duration::from_secs(2), ready_rx)
             .await
@@ -1120,7 +1252,8 @@ mod tests {
             trigger,
             None,
         );
-        let handle = tokio::spawn(runner.run_with_initial_ready(events_rx, shutdown_rx, ready_tx));
+        let handle =
+            tokio::spawn(runner.run_with_initial_ready(events_rx, shutdown_rx, ready_tx, None));
 
         let ready = timeout(Duration::from_secs(2), ready_rx)
             .await
@@ -1149,6 +1282,70 @@ mod tests {
         assert_eq!(trigger.calls.load(Ordering::SeqCst), 1);
 
         let _ = shutdown.send(true);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_on_startup_waits_for_baseline_then_triggers_and_rebaselines() {
+        let reader = Arc::new(TestStateReader::new(&["base", "after"]));
+        let trigger = Arc::new(TestTrigger::new(Duration::ZERO));
+        let (_events_tx, events_rx) = mpsc::channel(64);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (startup_tx, startup_rx) = watch::channel(false);
+        let runner = FsStateRunner::new_with_settle(
+            "local",
+            Duration::from_millis(5),
+            Duration::from_millis(50),
+            Duration::ZERO,
+            Some(reader.clone() as Arc<dyn StateReader>),
+            trigger.clone(),
+            None,
+        );
+        let handle =
+            tokio::spawn(runner.run_with_startup_signal(events_rx, shutdown_rx, startup_rx));
+
+        wait_for_calls(&reader.calls, 1).await;
+        assert_eq!(trigger.calls.load(Ordering::SeqCst), 0);
+        startup_tx.send(true).unwrap();
+        wait_for_calls(&trigger.calls, 1).await;
+        wait_for_calls(&reader.calls, 2).await;
+        assert_eq!(trigger.calls.load(Ordering::SeqCst), 1);
+
+        let _ = shutdown_tx.send(true);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_on_startup_self_events_do_not_trigger_loop() {
+        let reader = Arc::new(TestStateReader::new(&["base", "after"]));
+        let (events_tx, events_rx) = mpsc::channel(64);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (startup_tx, startup_rx) = watch::channel(false);
+        let trigger = Arc::new(TestTrigger {
+            calls: Arc::new(AtomicUsize::new(0)),
+            delay: Duration::from_millis(30),
+            event_during_run: Some(events_tx.clone()),
+            result: TestTriggerResult::Success,
+        });
+        let runner = FsStateRunner::new_with_settle(
+            "local",
+            Duration::from_millis(5),
+            Duration::from_millis(50),
+            Duration::ZERO,
+            Some(reader.clone() as Arc<dyn StateReader>),
+            trigger.clone(),
+            None,
+        );
+        let handle =
+            tokio::spawn(runner.run_with_startup_signal(events_rx, shutdown_rx, startup_rx));
+
+        wait_for_calls(&reader.calls, 1).await;
+        startup_tx.send(true).unwrap();
+        wait_for_calls(&reader.calls, 2).await;
+        sleep(Duration::from_millis(80)).await;
+        assert_eq!(trigger.calls.load(Ordering::SeqCst), 1);
+
+        let _ = shutdown_tx.send(true);
         handle.await.unwrap();
     }
 

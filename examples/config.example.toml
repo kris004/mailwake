@@ -36,6 +36,7 @@ type = "imap_idle"
 account = "example-imap"
 mailbox = "INBOX"
 on_event = "remote-sync"
+run_on_startup = true
 debounce_seconds = 10
 
 [[sources]]
@@ -45,5 +46,6 @@ watch_paths = ["/home/alice/.mail/example/.notmuch"]
 recursive = false
 state_cmd = "cd /home/alice/.mail/example && notmuch count --lastmod"
 on_change = "local-push"
+run_on_startup = false
 debounce_seconds = 5
 max_debounce_seconds = 60
