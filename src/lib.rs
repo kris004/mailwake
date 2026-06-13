@@ -7,4 +7,5 @@ pub mod imap;
 pub mod lane;
 pub mod process;
 pub mod state;
+pub mod system_resume;
 pub mod systemd;

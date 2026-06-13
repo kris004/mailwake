@@ -19,6 +19,7 @@ pub const DEFAULT_COMMAND_TIMEOUT_SECONDS: u64 = 300;
 pub const DEFAULT_CONNECT_TIMEOUT_SECONDS: u64 = 30;
 pub const DEFAULT_IMAP_OPERATION_TIMEOUT_SECONDS: u64 = 60;
 pub const DEFAULT_MIN_COMMAND_INTERVAL_SECONDS: u64 = 60;
+pub const DEFAULT_SYSTEM_RESUME_SETTLE_SECONDS: u64 = 15;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -145,6 +146,7 @@ pub struct CommandConfig {
 pub enum SourceConfig {
     ImapIdle(ImapIdleSourceConfig),
     FsState(FsStateSourceConfig),
+    SystemResume(SystemResumeSourceConfig),
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -176,6 +178,15 @@ pub struct FsStateSourceConfig {
     pub debounce_seconds: Option<u64>,
     #[serde(default)]
     pub max_debounce_seconds: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SystemResumeSourceConfig {
+    pub name: String,
+    pub on_resume: String,
+    #[serde(default)]
+    pub settle_seconds: Option<u64>,
 }
 
 #[derive(Debug, Error)]
@@ -571,6 +582,14 @@ impl Config {
                         );
                     }
                 }
+                SourceConfig::SystemResume(source) => {
+                    if source.settle_seconds == Some(0) {
+                        warn!(
+                            source = %source.name,
+                            "settle_seconds=0 disables resume settle delay for this system_resume source by explicit configuration"
+                        );
+                    }
+                }
                 SourceConfig::ImapIdle(_) => {}
             }
         }
@@ -641,6 +660,7 @@ impl SourceConfig {
         match self {
             Self::ImapIdle(source) => &source.name,
             Self::FsState(source) => &source.name,
+            Self::SystemResume(source) => &source.name,
         }
     }
 
@@ -698,6 +718,10 @@ impl SourceConfig {
                 }
                 let _ = source.max_debounce(config);
             }
+            Self::SystemResume(source) => {
+                validate_nonempty("source on_resume", &source.on_resume)?;
+                validate_command_reference("on_resume", &source.on_resume, command_names)?;
+            }
         }
         Ok(())
     }
@@ -726,6 +750,14 @@ impl FsStateSourceConfig {
         self.max_debounce_seconds
             .map(Duration::from_secs)
             .unwrap_or_else(|| config.default_max_debounce())
+    }
+}
+
+impl SystemResumeSourceConfig {
+    pub fn settle(&self) -> Duration {
+        self.settle_seconds
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| Duration::from_secs(DEFAULT_SYSTEM_RESUME_SETTLE_SECONDS))
     }
 }
 
@@ -1175,6 +1207,62 @@ on_change = "local-push"
         assert!(!source.run_on_startup);
         assert_eq!(source.debounce(&config).as_secs(), 5);
         assert_eq!(source.max_debounce(&config).as_secs(), 60);
+    }
+
+    #[test]
+    fn parses_generic_system_resume_source() {
+        let config = Config::parse_str(
+            r#"
+[[commands]]
+name = "wake-command"
+lane = "sync"
+cmd = "echo wake"
+timeout_seconds = 30
+min_interval_seconds = 0
+
+[[sources]]
+name = "system-resume"
+type = "system_resume"
+on_resume = "wake-command"
+settle_seconds = 20
+"#,
+        )
+        .expect("system_resume-only config should parse");
+
+        assert!(config.accounts.is_empty());
+        assert_eq!(config.source_count(), 1);
+        assert_eq!(config.command_count(), 1);
+        assert_eq!(config.command_lane_count(), 1);
+        let SourceConfig::SystemResume(source) = &config.sources[0] else {
+            panic!("source should be system_resume");
+        };
+        assert_eq!(source.on_resume, "wake-command");
+        assert_eq!(source.settle().as_secs(), 20);
+    }
+
+    #[test]
+    fn system_resume_settle_defaults_to_fifteen_seconds() {
+        let config = Config::parse_str(
+            r#"
+[[commands]]
+name = "wake-command"
+cmd = "echo wake"
+
+[[sources]]
+name = "system-resume"
+type = "system_resume"
+on_resume = "wake-command"
+"#,
+        )
+        .expect("system_resume config should parse");
+
+        let SourceConfig::SystemResume(source) = &config.sources[0] else {
+            panic!("source should be system_resume");
+        };
+        assert_eq!(
+            source.settle().as_secs(),
+            DEFAULT_SYSTEM_RESUME_SETTLE_SECONDS
+        );
     }
 
     #[test]

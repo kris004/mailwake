@@ -8,9 +8,9 @@ commands.
 event source -> debounce/coalesce/cooldown -> command lane -> run configured command
 ```
 
-IMAP IDLE is one source type. `fs_state` is another source type for local
-filesystem/state changes. The daemon intentionally treats both as wake-up
-signals, not as work-item queues.
+IMAP IDLE, `fs_state`, and `system_resume` are source types. The daemon
+intentionally treats all source events as wake-up signals, not as work-item
+queues.
 
 ## Non-goals
 
@@ -22,7 +22,8 @@ signals, not as work-item queues.
 - know about lieer, notmuch, mbsync, Gmail labels, Maildir, or aerc internals;
 - implement a browser/device-code OAuth flow;
 - act as a general automation framework;
-- recursively crawl or sync local filesystem trees.
+- recursively crawl or sync local filesystem trees;
+- install system sleep hooks or require root privileges for resume events.
 
 Keep the daemon boring: event in, command out.
 
@@ -197,11 +198,12 @@ run_on_startup = false
 debounce_seconds = 10
 ```
 
-Top-level sources can also set `run_on_startup = true` to queue their normal
-configured command once when the daemon starts. This is generic: `imap_idle`
-sources queue `on_event`, and `fs_state` sources queue `on_change`. Startup
-commands use the same command lanes, timeouts, cooldowns, and coalescing as
-event-triggered commands; commands in the same lane still do not overlap.
+The `imap_idle` and `fs_state` source types can also set
+`run_on_startup = true` to queue their normal configured command once when the
+daemon starts. This is generic: `imap_idle` sources queue `on_event`, and
+`fs_state` sources queue `on_change`. Startup commands use the same command
+lanes, timeouts, cooldowns, and coalescing as event-triggered commands; commands
+in the same lane still do not overlap.
 
 `mailwake` reports `READY=1` after source tasks are supervised. After that,
 `run_on_startup` commands are released into the normal command system. For
@@ -265,6 +267,46 @@ Warnings:
   email file.
 - For huge mailboxes, rely on coalescing: let the watcher see a small state path
   and run `state_cmd` once per settled batch.
+
+## `system_resume` sources
+
+`system_resume` is a generic wake/resume event source. On Linux systems with
+systemd/logind, it subscribes to the D-Bus
+`org.freedesktop.login1.Manager.PrepareForSleep` signal. `PrepareForSleep(true)`
+records that the system is entering sleep; `PrepareForSleep(false)` is treated
+as resume/wake. After resume, `mailwake` waits `settle_seconds` before queuing
+the configured command.
+
+This is useful on laptops because network sessions, including IMAP IDLE
+connections, may be stale after suspend/resume even when no fresh IMAP event is
+delivered. The source remains generic: it only observes a system resume event
+and triggers `on_resume`.
+
+```toml
+[[commands]]
+name = "remote-sync"
+lane = "example-sync"
+cmd = "cd /home/alice/.mail/example && flock -n .sync.lock gmi sync && notmuch new"
+timeout_seconds = 300
+min_interval_seconds = 60
+
+[[sources]]
+name = "system-resume"
+type = "system_resume"
+on_resume = "remote-sync"
+settle_seconds = 20
+```
+
+`settle_seconds` defaults to 15. Multiple resume signals close together are
+coalesced into one settled command request. The request uses the same command
+lanes, cooldowns, timeouts, and shutdown behavior as every other source; it does
+not bypass lane serialization and does not run overlapping commands.
+
+`system_resume` is optional. If no `system_resume` source is configured,
+`mailwake` does not connect to D-Bus. If a configured `system_resume` source
+cannot connect to systemd/logind D-Bus, that source is unhealthy; with
+`--initial-connect-required`, startup fails instead of reporting ready. It does
+not use `/usr/lib/systemd/system-sleep` hooks and does not require root.
 
 ## CLI
 
@@ -410,7 +452,9 @@ preflight; helpers run when IMAP watchers connect and are bounded by
 until every watcher completes initial setup before `READY=1` (for IMAP, that
 means one successful login/select/IDLE setup; for `fs_state`, it means the
 filesystem watcher was installed and any configured startup `state_cmd` attempt
-completed successfully). If an `fs_state` startup baseline fails while
+completed successfully; for `system_resume`, it means the systemd/logind D-Bus
+subscription is active). If an `fs_state` startup baseline fails or a
+`system_resume` D-Bus subscription cannot be installed while
 `--initial-connect-required` is set, startup fails instead of reporting ready.
 
 Readiness is therefore not the same as "currently connected to Gmail" unless

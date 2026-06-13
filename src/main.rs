@@ -12,6 +12,7 @@ use mailwake::lane::{
     CommandLaneRunner, CommandRequest, CommandTrigger, CommandTriggerTarget, LaneCommand,
 };
 use mailwake::state::{CommandRunnerPhase, RuntimeState, WatcherPhase};
+use mailwake::system_resume::{SystemResumeRunner, SystemResumeWatcherTask};
 use mailwake::systemd::{self, Notifier};
 use std::collections::HashMap;
 use std::env;
@@ -528,6 +529,42 @@ async fn run_daemon(
                     shutdown: shutdown_rx.clone(),
                 }));
             }
+            SourceConfig::SystemResume(source) => {
+                let watcher_id = source.name.clone();
+                state.register_watcher(watcher_id.clone());
+                let trigger = command_trigger(&command_senders, &source.on_resume, &watcher_id)?;
+                let runner = SystemResumeRunner::new(
+                    source.name.clone(),
+                    source.settle(),
+                    trigger,
+                    Some(Arc::clone(&state)),
+                );
+                let (events_tx, events_rx) = mpsc::channel(64);
+                task_handles.push(spawn_system_resume_runner(
+                    runner,
+                    events_rx,
+                    Arc::clone(&state),
+                    watcher_id.clone(),
+                    source.name.clone(),
+                    shutdown_rx.clone(),
+                ));
+
+                let initial_ready = if initial_connect_required {
+                    let (ready_tx, ready_rx) = oneshot::channel();
+                    initial_receivers.push(ready_rx);
+                    Some(ready_tx)
+                } else {
+                    None
+                };
+                task_handles.push(spawn_system_resume_watcher(SystemResumeWatcherTask {
+                    source,
+                    events_tx,
+                    state: Arc::clone(&state),
+                    watcher_id,
+                    initial_ready,
+                    shutdown: shutdown_rx.clone(),
+                }));
+            }
         }
     }
 
@@ -739,6 +776,47 @@ fn spawn_fs_state_watcher(task: FsStateWatcherTask) -> JoinHandle<()> {
                 source = %source_name,
                 %error,
                 "fs_state watcher task crashed"
+            );
+        }
+    })
+}
+
+fn spawn_system_resume_runner(
+    runner: SystemResumeRunner,
+    event_rx: mpsc::Receiver<()>,
+    state: Arc<RuntimeState>,
+    watcher_id: String,
+    source_name: String,
+    shutdown: watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    let handle = tokio::spawn(runner.run(event_rx, shutdown));
+    tokio::spawn(async move {
+        if let Err(error) = handle.await {
+            state.mark_watcher(&watcher_id, WatcherPhase::Crashed);
+            error!(
+                source = %source_name,
+                %error,
+                "system_resume runner task crashed"
+            );
+        }
+    })
+}
+
+fn spawn_system_resume_watcher(task: SystemResumeWatcherTask) -> JoinHandle<()> {
+    let state = Arc::clone(&task.state);
+    let watcher_id = task.watcher_id.clone();
+    let source_name = task.source.name.clone();
+    let handle = tokio::spawn(async move {
+        mailwake::system_resume::watch_system_resume_forever(task).await;
+    });
+
+    tokio::spawn(async move {
+        if let Err(error) = handle.await {
+            state.mark_watcher(&watcher_id, WatcherPhase::Crashed);
+            error!(
+                source = %source_name,
+                %error,
+                "system_resume watcher task crashed"
             );
         }
     })

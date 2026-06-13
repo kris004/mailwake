@@ -40,6 +40,12 @@ run_on_startup = true
 debounce_seconds = 10
 
 [[sources]]
+name = "system-resume"
+type = "system_resume"
+on_resume = "remote-sync"
+settle_seconds = 20
+
+[[sources]]
 name = "local-state"
 type = "fs_state"
 watch_paths = ["/home/alice/.mail/example/.notmuch"]
