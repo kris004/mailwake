@@ -9,7 +9,6 @@ use mailwake::debounce::DebounceRunner;
 use mailwake::fs_state::{
     FsStateEvent, FsStateRunner, FsStateWatcherTask, ShellStateReader, StateReader,
 };
-use mailwake::gmail_api::{GmailApiSettings, GmailApiWatchTask, ReqwestGmailApiClient};
 use mailwake::imap;
 use mailwake::lane::{
     CommandLaneRunner, CommandRequest, CommandTrigger, CommandTriggerTarget, LaneCommand,
@@ -606,67 +605,6 @@ async fn run_daemon(
                     shutdown: shutdown_rx.clone(),
                 }));
             }
-            SourceConfig::GmailApiWatch(source) => {
-                let watcher_id = source.name.clone();
-                state.register_watcher(watcher_id.clone());
-
-                let (event_tx, event_rx) = mpsc::channel(64);
-                let trigger = command_trigger(&command_senders, &source.on_event, &watcher_id)?;
-                if source.run_on_startup {
-                    task_handles.push(spawn_startup_event(
-                        source.name.clone(),
-                        event_tx.clone(),
-                        startup_rx.clone(),
-                        shutdown_rx.clone(),
-                    ));
-                }
-                let debounce_runner = DebounceRunner::new(
-                    source.name.clone(),
-                    "gmail_api",
-                    source.debounce(&config),
-                    Duration::ZERO,
-                    trigger,
-                    Some(Arc::clone(&state)),
-                );
-                task_handles.push(spawn_debounce_runner(
-                    debounce_runner,
-                    event_rx,
-                    Arc::clone(&state),
-                    watcher_id.clone(),
-                    source.name.clone(),
-                    shutdown_rx.clone(),
-                ));
-
-                let initial_ready = if initial_connect_required {
-                    let (ready_tx, ready_rx) = oneshot::channel();
-                    initial_receivers.push(ready_rx);
-                    Some(ready_tx)
-                } else {
-                    None
-                };
-                let client = Arc::new(ReqwestGmailApiClient::new(source.api_timeout())?);
-                let settings = GmailApiSettings {
-                    auth_helper_timeout: config.auth_helper_timeout(),
-                    auth_helper_max_output_bytes: config.auth_helper_max_output_bytes(),
-                    request_timeout: source.api_timeout(),
-                    watch_renewal: source.watch_renewal(),
-                    pull_max_messages: source.pull_max_messages(),
-                    empty_pull_delay: source.empty_pull_delay(),
-                };
-                task_handles.push(spawn_gmail_api_watcher(
-                    GmailApiWatchTask {
-                        source,
-                        events: event_tx,
-                        state: Arc::clone(&state),
-                        watcher_id,
-                        initial_ready,
-                        shutdown: shutdown_rx.clone(),
-                        settings,
-                        client,
-                    },
-                    fatal_tx.clone(),
-                ));
-            }
         }
     }
 
@@ -677,7 +615,7 @@ async fn run_daemon(
                 result = ready => match result.context("watcher stopped before initial setup completed")? {
                     Ok(()) => {}
                     Err(error) => {
-                        if is_initial_auth_failure(&error) {
+                        if error.starts_with(mailwake::imap::INITIAL_AUTH_FAILURE_PREFIX) {
                             return Err(CodedExitError::permanent_auth(format!(
                                 "initial watcher setup failed: {error}"
                             ))
@@ -962,43 +900,6 @@ fn spawn_system_resume_watcher(task: SystemResumeWatcherTask) -> JoinHandle<()> 
     })
 }
 
-fn spawn_gmail_api_watcher(
-    task: GmailApiWatchTask,
-    fatal_tx: mpsc::UnboundedSender<CodedExitError>,
-) -> JoinHandle<()> {
-    let state = Arc::clone(&task.state);
-    let watcher_id = task.watcher_id.clone();
-    let source_name = task.source.name.clone();
-    let handle =
-        tokio::spawn(async move { mailwake::gmail_api::watch_gmail_api_forever(task).await });
-
-    tokio::spawn(async move {
-        match handle.await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                state.mark_watcher(&watcher_id, WatcherPhase::Crashed);
-                let message = format!(
-                    "Gmail API watcher for source {source_name:?} stopped after an authentication or permission failure: {error}"
-                );
-                error!(
-                    source = %source_name,
-                    %error,
-                    "Gmail API watcher stopped after an authentication or permission failure"
-                );
-                let _ = fatal_tx.send(CodedExitError::permanent_auth(message));
-            }
-            Err(error) => {
-                state.mark_watcher(&watcher_id, WatcherPhase::Crashed);
-                error!(
-                    source = %source_name,
-                    %error,
-                    "Gmail API watcher task crashed"
-                );
-            }
-        }
-    })
-}
-
 struct ImapWatcherTask {
     account: mailwake::config::AccountConfig,
     mailbox: mailwake::config::MailboxConfig,
@@ -1008,11 +909,6 @@ struct ImapWatcherTask {
     initial_ready: Option<oneshot::Sender<Result<(), String>>>,
     shutdown: watch::Receiver<bool>,
     settings: mailwake::imap::WatcherSettings,
-}
-
-fn is_initial_auth_failure(error: &str) -> bool {
-    error.starts_with(mailwake::imap::INITIAL_AUTH_FAILURE_PREFIX)
-        || error.starts_with(mailwake::gmail_api::INITIAL_AUTH_FAILURE_PREFIX)
 }
 
 fn spawn_watcher(
