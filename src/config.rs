@@ -23,6 +23,9 @@ pub const DEFAULT_CONNECT_TIMEOUT_SECONDS: u64 = 30;
 pub const DEFAULT_IMAP_OPERATION_TIMEOUT_SECONDS: u64 = 60;
 pub const DEFAULT_MIN_COMMAND_INTERVAL_SECONDS: u64 = 60;
 pub const DEFAULT_SYSTEM_RESUME_SETTLE_SECONDS: u64 = 15;
+pub const DEFAULT_GMAIL_API_POLL_INTERVAL_SECONDS: u64 = 60;
+pub const DEFAULT_GMAIL_API_TIMEOUT_SECONDS: u64 = 60;
+pub const DEFAULT_GMAIL_API_HISTORY_PAGE_SIZE: u32 = 100;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -156,6 +159,7 @@ pub struct CommandConfig {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SourceConfig {
     ImapIdle(ImapIdleSourceConfig),
+    GmailApiPoll(GmailApiPollSourceConfig),
     FsState(FsStateSourceConfig),
     SystemResume(SystemResumeSourceConfig),
 }
@@ -171,6 +175,26 @@ pub struct ImapIdleSourceConfig {
     pub run_on_startup: bool,
     #[serde(default)]
     pub debounce_seconds: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GmailApiPollSourceConfig {
+    pub name: String,
+    pub on_event: String,
+    pub gmail_token_cmd: String,
+    #[serde(default)]
+    pub label_ids: Vec<String>,
+    #[serde(default)]
+    pub run_on_startup: bool,
+    #[serde(default)]
+    pub debounce_seconds: Option<u64>,
+    #[serde(default)]
+    pub poll_interval_seconds: Option<u64>,
+    #[serde(default)]
+    pub api_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub history_page_size: Option<u32>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -613,6 +637,14 @@ impl Config {
                         "debounce_seconds=0 disables debounce for this IMAP IDLE source by explicit configuration"
                     );
                 }
+                SourceConfig::GmailApiPoll(source) => {
+                    if source.debounce_seconds == Some(0) {
+                        warn!(
+                            source = %source.name,
+                            "debounce_seconds=0 disables debounce for this Gmail API poll source by explicit configuration"
+                        );
+                    }
+                }
                 SourceConfig::FsState(source) => {
                     if source.debounce_seconds == Some(0) {
                         warn!(
@@ -713,6 +745,7 @@ impl SourceConfig {
     pub fn name(&self) -> &str {
         match self {
             Self::ImapIdle(source) => &source.name,
+            Self::GmailApiPoll(source) => &source.name,
             Self::FsState(source) => &source.name,
             Self::SystemResume(source) => &source.name,
         }
@@ -746,6 +779,39 @@ impl SourceConfig {
                     )));
                 }
                 validate_command_reference("on_event", &source.on_event, command_names)?;
+            }
+            Self::GmailApiPoll(source) => {
+                validate_nonempty("source on_event", &source.on_event)?;
+                validate_nonempty("source gmail_token_cmd", &source.gmail_token_cmd)?;
+                validate_command_reference("on_event", &source.on_event, command_names)?;
+                for label_id in &source.label_ids {
+                    validate_nonempty("source label_ids", label_id)?;
+                    validate_no_crlf("source label_ids", label_id)?;
+                }
+                if let Some(debounce) = source.debounce_seconds {
+                    validate_nonzero_seconds("source debounce_seconds", debounce)?;
+                }
+                if let Some(poll_interval) = source.poll_interval_seconds {
+                    validate_nonzero_seconds("source poll_interval_seconds", poll_interval)?;
+                    if poll_interval < 10 {
+                        return Err(ConfigError::Invalid(format!(
+                            "gmail_api_poll source {:?} poll_interval_seconds must be at least 10 seconds, got {poll_interval}",
+                            source.name
+                        )));
+                    }
+                }
+                if let Some(api_timeout) = source.api_timeout_seconds {
+                    validate_nonzero_seconds("source api_timeout_seconds", api_timeout)?;
+                }
+                if let Some(history_page_size) = source.history_page_size {
+                    validate_nonzero_count("source history_page_size", history_page_size as usize)?;
+                    if history_page_size > 500 {
+                        return Err(ConfigError::Invalid(format!(
+                            "gmail_api_poll source {:?} history_page_size must be at most 500, got {history_page_size}",
+                            source.name
+                        )));
+                    }
+                }
             }
             Self::FsState(source) => {
                 validate_nonempty("source on_change", &source.on_change)?;
@@ -786,6 +852,33 @@ impl ImapIdleSourceConfig {
         self.debounce_seconds
             .map(Duration::from_secs)
             .unwrap_or_else(|| config.default_debounce())
+    }
+}
+
+impl GmailApiPollSourceConfig {
+    pub fn debounce(&self, config: &Config) -> Duration {
+        self.debounce_seconds
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| config.default_debounce())
+    }
+
+    pub fn poll_interval(&self) -> Duration {
+        Duration::from_secs(
+            self.poll_interval_seconds
+                .unwrap_or(DEFAULT_GMAIL_API_POLL_INTERVAL_SECONDS),
+        )
+    }
+
+    pub fn api_timeout(&self) -> Duration {
+        Duration::from_secs(
+            self.api_timeout_seconds
+                .unwrap_or(DEFAULT_GMAIL_API_TIMEOUT_SECONDS),
+        )
+    }
+
+    pub fn history_page_size(&self) -> u32 {
+        self.history_page_size
+            .unwrap_or(DEFAULT_GMAIL_API_HISTORY_PAGE_SIZE)
     }
 }
 
@@ -1449,6 +1542,152 @@ on_change = "local-push"
         assert!(imap.run_on_startup);
         assert!(fs_state.run_on_startup);
         assert!(!default_fs_state.run_on_startup);
+    }
+
+    #[test]
+    fn parses_gmail_api_poll_source() {
+        let config = Config::parse_str(
+            r#"
+[[commands]]
+name = "remote-sync"
+cmd = "echo remote"
+
+[[sources]]
+name = "gmail-inbox"
+type = "gmail_api_poll"
+on_event = "remote-sync"
+gmail_token_cmd = "/home/alice/.local/bin/gmail-api-token"
+label_ids = ["INBOX"]
+run_on_startup = true
+debounce_seconds = 10
+poll_interval_seconds = 60
+api_timeout_seconds = 30
+history_page_size = 50
+"#,
+        )
+        .expect("gmail_api_poll config should parse");
+
+        let SourceConfig::GmailApiPoll(source) = &config.sources[0] else {
+            panic!("source should be gmail_api_poll");
+        };
+        assert_eq!(source.name, "gmail-inbox");
+        assert_eq!(source.on_event, "remote-sync");
+        assert_eq!(
+            source.gmail_token_cmd,
+            "/home/alice/.local/bin/gmail-api-token"
+        );
+        assert_eq!(source.label_ids, ["INBOX"]);
+        assert!(source.run_on_startup);
+        assert_eq!(source.debounce(&config).as_secs(), 10);
+        assert_eq!(source.poll_interval().as_secs(), 60);
+        assert_eq!(source.api_timeout().as_secs(), 30);
+        assert_eq!(source.history_page_size(), 50);
+    }
+
+    #[test]
+    fn gmail_api_poll_defaults_are_conservative() {
+        let config = Config::parse_str(
+            r#"
+[[commands]]
+name = "remote-sync"
+cmd = "echo remote"
+
+[[sources]]
+name = "gmail-any-change"
+type = "gmail_api_poll"
+on_event = "remote-sync"
+gmail_token_cmd = "gmail-api-token"
+"#,
+        )
+        .expect("minimal gmail_api_poll config should parse");
+
+        let SourceConfig::GmailApiPoll(source) = &config.sources[0] else {
+            panic!("source should be gmail_api_poll");
+        };
+        assert!(source.label_ids.is_empty());
+        assert!(!source.run_on_startup);
+        assert_eq!(
+            source.poll_interval().as_secs(),
+            DEFAULT_GMAIL_API_POLL_INTERVAL_SECONDS
+        );
+        assert_eq!(
+            source.api_timeout().as_secs(),
+            DEFAULT_GMAIL_API_TIMEOUT_SECONDS
+        );
+        assert_eq!(
+            source.history_page_size(),
+            DEFAULT_GMAIL_API_HISTORY_PAGE_SIZE
+        );
+    }
+
+    #[test]
+    fn gmail_api_poll_validates_helpers_labels_and_polling_knobs() {
+        let missing_helper = Config::parse_str(
+            r#"
+[[commands]]
+name = "remote-sync"
+cmd = "echo remote"
+
+[[sources]]
+name = "gmail-inbox"
+type = "gmail_api_poll"
+on_event = "remote-sync"
+gmail_token_cmd = ""
+"#,
+        )
+        .expect_err("gmail_token_cmd is required");
+        assert!(missing_helper.to_string().contains("gmail_token_cmd"));
+
+        let bad_label = Config::parse_str(
+            r#"
+[[commands]]
+name = "remote-sync"
+cmd = "echo remote"
+
+[[sources]]
+name = "gmail-inbox"
+type = "gmail_api_poll"
+on_event = "remote-sync"
+gmail_token_cmd = "gmail-api-token"
+label_ids = ["IN\nBOX"]
+"#,
+        )
+        .expect_err("label ids must be safe IMAP/API strings");
+        assert!(bad_label.to_string().contains("label_ids"));
+
+        let too_fast = Config::parse_str(
+            r#"
+[[commands]]
+name = "remote-sync"
+cmd = "echo remote"
+
+[[sources]]
+name = "gmail-inbox"
+type = "gmail_api_poll"
+on_event = "remote-sync"
+gmail_token_cmd = "gmail-api-token"
+poll_interval_seconds = 5
+"#,
+        )
+        .expect_err("poll interval should have a minimum");
+        assert!(too_fast.to_string().contains("poll_interval_seconds"));
+
+        let too_large_page = Config::parse_str(
+            r#"
+[[commands]]
+name = "remote-sync"
+cmd = "echo remote"
+
+[[sources]]
+name = "gmail-inbox"
+type = "gmail_api_poll"
+on_event = "remote-sync"
+gmail_token_cmd = "gmail-api-token"
+history_page_size = 501
+"#,
+        )
+        .expect_err("history page size should be capped");
+        assert!(too_large_page.to_string().contains("history_page_size"));
     }
 
     #[test]

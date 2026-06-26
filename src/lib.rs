@@ -3,6 +3,7 @@ pub mod command;
 pub mod config;
 pub mod debounce;
 pub mod fs_state;
+pub mod gmail_api_poll;
 pub mod imap;
 pub mod lane;
 pub mod process;

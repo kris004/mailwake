@@ -1,4 +1,4 @@
-use crate::config::{AccountConfig, AuthMethod, Config, SecretString};
+use crate::config::{AccountConfig, AuthMethod, Config, SecretString, SourceConfig};
 use crate::process::{ShellProcessError, ShellRun, run_shell_process};
 use std::env;
 use std::fmt;
@@ -75,6 +75,11 @@ pub fn validate_auth_helpers(config: &Config) -> Result<(), AuthError> {
                 check_helper_exists_if_practical(cmd)?;
             }
             AuthMethod::Password => {}
+        }
+    }
+    for source in &config.sources {
+        if let SourceConfig::GmailApiPoll(source) = source {
+            check_helper_exists_if_practical(&source.gmail_token_cmd)?;
         }
     }
     Ok(())

@@ -9,6 +9,7 @@ use mailwake::debounce::DebounceRunner;
 use mailwake::fs_state::{
     FsStateEvent, FsStateRunner, FsStateWatcherTask, ShellStateReader, StateReader,
 };
+use mailwake::gmail_api_poll::{GmailApiPollSettings, GmailApiPollTask};
 use mailwake::imap;
 use mailwake::lane::{
     CommandLaneRunner, CommandRequest, CommandTrigger, CommandTriggerTarget, LaneCommand,
@@ -335,6 +336,17 @@ async fn run_daemon(
     config.warn_for_insecure_options();
 
     let command_specs = runtime_command_specs(&config);
+    let max_watcher_operation_timeout =
+        config
+            .sources
+            .iter()
+            .fold(
+                config.imap_operation_timeout(),
+                |max_timeout, source| match source {
+                    SourceConfig::GmailApiPoll(source) => max_timeout.max(source.api_timeout()),
+                    _ => max_timeout,
+                },
+            );
     let max_command_timeout = command_specs
         .iter()
         .map(|command| command.timeout)
@@ -521,6 +533,63 @@ async fn run_daemon(
                     fatal_tx.clone(),
                 ));
             }
+            SourceConfig::GmailApiPoll(source) => {
+                let watcher_id = source.name.clone();
+                state.register_watcher(watcher_id.clone());
+
+                let (event_tx, event_rx) = mpsc::channel(64);
+                let trigger = command_trigger(&command_senders, &source.on_event, &watcher_id)?;
+                if source.run_on_startup {
+                    task_handles.push(spawn_startup_event(
+                        source.name.clone(),
+                        event_tx.clone(),
+                        startup_rx.clone(),
+                        shutdown_rx.clone(),
+                    ));
+                }
+                let debounce_runner = DebounceRunner::new(
+                    "gmail_api",
+                    source.name.clone(),
+                    source.debounce(&config),
+                    Duration::ZERO,
+                    trigger,
+                    Some(Arc::clone(&state)),
+                );
+                task_handles.push(spawn_debounce_runner(
+                    debounce_runner,
+                    event_rx,
+                    Arc::clone(&state),
+                    watcher_id.clone(),
+                    source.name.clone(),
+                    shutdown_rx.clone(),
+                ));
+
+                let initial_ready = if initial_connect_required {
+                    let (ready_tx, ready_rx) = oneshot::channel();
+                    initial_receivers.push(ready_rx);
+                    Some(ready_tx)
+                } else {
+                    None
+                };
+                let settings = GmailApiPollSettings {
+                    auth_helper_timeout: config.auth_helper_timeout(),
+                    auth_helper_max_output_bytes: config.auth_helper_max_output_bytes(),
+                    poll_interval: source.poll_interval(),
+                    api_timeout: source.api_timeout(),
+                };
+                task_handles.push(spawn_gmail_api_poll_watcher(
+                    GmailApiPollTask {
+                        source,
+                        events: event_tx,
+                        state: Arc::clone(&state),
+                        watcher_id,
+                        initial_ready,
+                        shutdown: shutdown_rx.clone(),
+                        settings,
+                    },
+                    fatal_tx.clone(),
+                ));
+            }
             SourceConfig::FsState(source) => {
                 let watcher_id = source.name.clone();
                 let run_on_startup = source.run_on_startup;
@@ -621,6 +690,14 @@ async fn run_daemon(
                             ))
                             .into());
                         }
+                        if error.starts_with(
+                            mailwake::gmail_api_poll::INITIAL_AUTH_FAILURE_PREFIX,
+                        ) {
+                            return Err(CodedExitError::permanent_auth(format!(
+                                "initial watcher setup failed: {error}"
+                            ))
+                            .into());
+                        }
                         bail!("initial watcher setup failed: {error}");
                     }
                 },
@@ -630,7 +707,7 @@ async fn run_daemon(
                     let _ = notifier.stopping();
                     await_task_shutdown(
                         task_handles,
-                        std::cmp::max(config.imap_operation_timeout(), max_command_timeout)
+                        std::cmp::max(max_watcher_operation_timeout, max_command_timeout)
                             + Duration::from_secs(5),
                     )
                     .await;
@@ -641,7 +718,7 @@ async fn run_daemon(
                     let _ = notifier.stopping();
                     await_task_shutdown(
                         task_handles,
-                        std::cmp::max(config.imap_operation_timeout(), max_command_timeout)
+                        std::cmp::max(max_watcher_operation_timeout, max_command_timeout)
                             + Duration::from_secs(5),
                     )
                     .await;
@@ -684,7 +761,7 @@ async fn run_daemon(
             }
             await_task_shutdown(
                 task_handles,
-                std::cmp::max(config.imap_operation_timeout(), max_command_timeout)
+                std::cmp::max(max_watcher_operation_timeout, max_command_timeout)
                     + Duration::from_secs(5),
             )
             .await;
@@ -697,8 +774,7 @@ async fn run_daemon(
     }
     await_task_shutdown(
         task_handles,
-        std::cmp::max(config.imap_operation_timeout(), max_command_timeout)
-            + Duration::from_secs(5),
+        std::cmp::max(max_watcher_operation_timeout, max_command_timeout) + Duration::from_secs(5),
     )
     .await;
     Ok(())
@@ -896,6 +972,53 @@ fn spawn_system_resume_watcher(task: SystemResumeWatcherTask) -> JoinHandle<()> 
                 %error,
                 "system_resume watcher task crashed"
             );
+        }
+    })
+}
+
+fn spawn_gmail_api_poll_watcher(
+    task: GmailApiPollTask,
+    fatal_tx: mpsc::UnboundedSender<CodedExitError>,
+) -> JoinHandle<()> {
+    let state = Arc::clone(&task.state);
+    let watcher_id = task.watcher_id.clone();
+    let source_name = task.source.name.clone();
+    let handle =
+        tokio::spawn(
+            async move { mailwake::gmail_api_poll::watch_gmail_api_poll_forever(task).await },
+        );
+
+    tokio::spawn(async move {
+        match handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) if error.is_permanent_auth_failure() => {
+                state.mark_watcher(&watcher_id, WatcherPhase::Crashed);
+                let message = format!(
+                    "Gmail API poller for source {source_name:?} stopped after an authentication or permission failure: {error}"
+                );
+                error!(
+                    source = %source_name,
+                    %error,
+                    "Gmail API poller stopped after an authentication or permission failure"
+                );
+                let _ = fatal_tx.send(CodedExitError::permanent_auth(message));
+            }
+            Ok(Err(error)) => {
+                state.mark_watcher(&watcher_id, WatcherPhase::Crashed);
+                error!(
+                    source = %source_name,
+                    %error,
+                    "Gmail API poller task stopped unexpectedly"
+                );
+            }
+            Err(error) => {
+                state.mark_watcher(&watcher_id, WatcherPhase::Crashed);
+                error!(
+                    source = %source_name,
+                    %error,
+                    "Gmail API poller task crashed"
+                );
+            }
         }
     })
 }

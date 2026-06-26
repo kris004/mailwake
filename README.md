@@ -8,9 +8,9 @@ commands.
 event source -> debounce/coalesce/cooldown -> command lane -> run configured command
 ```
 
-IMAP IDLE, `fs_state`, and `system_resume` are source types. The daemon
-intentionally treats all source events as wake-up signals, not as work-item
-queues.
+IMAP IDLE, Gmail API polling, `fs_state`, and `system_resume` are source types.
+The daemon intentionally treats all source events as wake-up signals, not as
+work-item queues.
 
 ## Non-goals
 
@@ -33,25 +33,31 @@ Secrets are not stored by `mailwake` by default. Long-running credential refresh
 is delegated to external commands:
 
 - `xoauth2_cmd` prints a fresh OAuth2 bearer token to stdout.
+- `gmail_token_cmd` prints a fresh Gmail API OAuth2 bearer token to stdout.
 - `password_cmd` prints a password or app password to stdout.
 - direct `password` exists only for local tests and throwaway accounts; it logs a
   loud warning without printing the value.
 
 The daemon trims trailing CR/LF from helper output and never logs helper output,
 OAuth tokens, passwords, command stdout/stderr, environment variables, or full
-systemd status details. Auth helpers are invoked only after TCP/TLS connection
-and the server greeting succeed, so offline/reconnect loops do not repeatedly
-refresh OAuth tokens before Gmail is reachable. Helpers run with
-`auth_helper_timeout_seconds`; if they time out or exceed
-`auth_helper_max_output_bytes`, `mailwake` terminates the helper's Unix process
-group so helper children are not left behind. OAuth token storage and refresh
-should be handled by the helper command. If an auth helper exits with status
-`78`, `mailwake` treats that as a user-action-required auth failure, exits with
-status `78`, and lets systemd keep the unit failed instead of retrying forever.
+systemd status details. IMAP auth helpers are invoked only after TCP/TLS
+connection and the server greeting succeed, so offline/reconnect loops do not
+repeatedly refresh OAuth tokens before the IMAP server is reachable. Gmail API
+token helpers run only when establishing the poll baseline or making a poll
+request. Helpers run with `auth_helper_timeout_seconds`; if they time out or
+exceed `auth_helper_max_output_bytes`, `mailwake` terminates the helper's Unix
+process group so helper children are not left behind. OAuth token storage and
+refresh should be handled by the helper command. If an auth helper exits with
+status `78`, `mailwake` treats that as a user-action-required auth failure,
+exits with status `78`, and lets systemd keep the unit failed instead of
+retrying forever.
 
-For Gmail, prefer `xoauth2_cmd`. App-password based accounts can use
-`password_cmd`. A full OAuth browser/device-code flow is intentionally outside
-this daemon.
+For Gmail, `imap_idle` with `xoauth2_cmd` is the true event-driven option but
+uses Google's broad IMAP/SMTP Gmail scope. `gmail_api_poll` is the lower-scope
+local option; it uses Gmail API metadata/history polling and does not require
+Cloud Pub/Sub, `gcloud`, or a hosted backend. App-password based accounts can
+use `password_cmd`. A full OAuth browser/device-code flow is intentionally
+outside this daemon.
 
 ## TLS defaults
 
@@ -119,6 +125,29 @@ debounce_seconds = 10
 
 Each configured mailbox gets its own IMAP connection so it can remain selected
 and in IDLE independently.
+
+Gmail API polling example:
+
+```toml
+[[commands]]
+name = "remote-sync"
+lane = "example-sync"
+cmd = "cd /home/alice/.mail/example && flock -n .sync.lock sync-command"
+
+[[sources]]
+name = "gmail-inbox"
+type = "gmail_api_poll"
+on_event = "remote-sync"
+gmail_token_cmd = "/home/alice/.local/bin/gmail-api-token"
+label_ids = ["INBOX"]
+run_on_startup = true
+debounce_seconds = 10
+poll_interval_seconds = 60
+```
+
+This source is not push/event based like IMAP IDLE. It polls Gmail metadata,
+compares Gmail history ids, optionally checks whether changed history matches
+configured labels, and then submits the normal `on_event` command.
 
 Useful global knobs:
 
@@ -249,12 +278,12 @@ run_on_startup = false
 debounce_seconds = 10
 ```
 
-The `imap_idle` and `fs_state` source types can also set
+The `imap_idle`, `gmail_api_poll`, and `fs_state` source types can also set
 `run_on_startup = true` to queue their normal configured command once when the
-daemon starts. This is generic: `imap_idle` sources queue `on_event`, and
-`fs_state` sources queue `on_change`. Startup commands use the same command
-lanes, timeouts, cooldowns, and coalescing as event-triggered commands; commands
-in the same lane still do not overlap.
+daemon starts. This is generic: `imap_idle` and `gmail_api_poll` sources queue
+`on_event`, and `fs_state` sources queue `on_change`. Startup commands use the
+same command lanes, timeouts, cooldowns, and coalescing as event-triggered
+commands; commands in the same lane still do not overlap.
 
 `mailwake` reports `READY=1` after source tasks are supervised. After that,
 `run_on_startup` commands are released into the normal command system. For
@@ -262,6 +291,36 @@ in the same lane still do not overlap.
 the startup command runs. If that command changes watched paths, `fs_state`
 uses the same self-trigger suppression and rebaseline behavior as a normal
 source-owned command.
+
+## `gmail_api_poll` sources
+
+`gmail_api_poll` is the local-only Gmail API source for users who want narrower
+OAuth than Gmail IMAP but do not want every install to set up Cloud Pub/Sub. It
+uses the Gmail API metadata scope:
+
+```text
+https://www.googleapis.com/auth/gmail.metadata
+```
+
+The poller calls Gmail `users.getProfile` to read the account's current
+`historyId`. When that id advances, it either queues the configured `on_event`
+command immediately or, when `label_ids` is configured, calls
+`users.history.list` with each configured label id and only queues the event if
+matching history exists. It does not read message bodies, send mail, modify
+mail, delete mail, or understand what the sync command does.
+
+Useful source knobs:
+
+```toml
+poll_interval_seconds = 60
+api_timeout_seconds = 60
+history_page_size = 100
+```
+
+`poll_interval_seconds` must be at least 10 seconds. Gmail history baselines can
+expire; if Gmail returns that the stored history id is too old, `mailwake`
+triggers once and rebaselines so the external sync command can repair local
+state.
 
 ## `fs_state` sources
 
@@ -433,14 +492,32 @@ gmail-oauth-token >/tmp/gmail-token-test
 rm /tmp/gmail-token-test
 ```
 
-The wrapper uses the IMAP/SMTP Gmail scope `https://mail.google.com/`, stores the
-OAuth client JSON under `~/.config/mailwake/`, and stores the `oauth2l` token
-cache under `~/.local/state/mailwake/` instead of oauth2l's default `~/.oauth2l`
-file. Run `--setup` interactively once before starting the systemd service. If
-Google reports that the cached refresh token is expired or revoked, the wrapper
-exits `78`. The wrapper also supports `--reauth` for systemd failure hooks: it
-resets the token cache, runs the OAuth flow, and suppresses token output so
-successful reauth does not write access tokens to the journal.
+The wrapper uses the IMAP/SMTP Gmail scope `https://mail.google.com/` by
+default, stores the OAuth client JSON under `~/.config/mailwake/`, and stores
+the `oauth2l` token cache under `~/.local/state/mailwake/` instead of oauth2l's
+default `~/.oauth2l` file. Run `--setup` interactively once before starting the
+systemd service. If Google reports that the cached refresh token is expired or
+revoked, the wrapper exits `78`. The wrapper also supports `--reauth` for
+systemd failure hooks: it resets the token cache, runs the OAuth flow, and
+suppresses token output so successful reauth does not write access tokens to the
+journal.
+
+For `gmail_api_poll`, wrap the same helper with the narrower Gmail metadata
+scope and a separate cache:
+
+```sh
+cat > /home/alice/.local/bin/gmail-api-token <<'EOF'
+#!/bin/sh
+set -eu
+export MAILWAKE_GMAIL_SCOPE='https://www.googleapis.com/auth/gmail.metadata'
+export MAILWAKE_OAUTH2L_CACHE="${XDG_STATE_HOME:-$HOME/.local/state}/mailwake/gmail-api-metadata-oauth2l-cache.json"
+exec /home/alice/.local/bin/gmail-oauth-token "$@"
+EOF
+chmod 700 /home/alice/.local/bin/gmail-api-token
+gmail-api-token --setup
+gmail-api-token >/tmp/gmail-api-token-test
+rm /tmp/gmail-api-token-test
+```
 
 For the legacy mailbox config shape, make the mailbox command run your existing
 sync/index path:
@@ -496,28 +573,30 @@ this in the service:
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 ```
 
-Absolute paths in `xoauth2_cmd`/`password_cmd` are still preferred because they
-make `check-config` and service startup behavior more predictable.
+Absolute paths in `xoauth2_cmd`, `gmail_token_cmd`, and `password_cmd` are still
+preferred because they make `check-config` and service startup behavior more
+predictable.
 
 The service uses `Type=notify`. With systemd available, `mailwake` sends
 `READY=1` after config parsing, auth-helper executable checks, and watcher task
 spawning. It does not execute OAuth/password helpers as a separate startup
-preflight; helpers run when IMAP watchers connect and are bounded by
+preflight; helpers run when network-backed watchers connect and are bounded by
 `auth_helper_timeout_seconds`. With `--initial-connect-required`, readiness waits
 until every watcher completes initial setup before `READY=1` (for IMAP, that
-means one successful login/examine/IDLE setup; for `fs_state`, it means the
-filesystem watcher was installed and any configured startup `state_cmd` attempt
-completed successfully; for `system_resume`, it means the systemd/logind D-Bus
+means one successful login/examine/IDLE setup; for `gmail_api_poll`, it means
+one successful metadata baseline; for `fs_state`, it means the filesystem
+watcher was installed and any configured startup `state_cmd` attempt completed
+successfully; for `system_resume`, it means the systemd/logind D-Bus
 subscription is active). If an `fs_state` startup baseline fails or a
 `system_resume` D-Bus subscription cannot be installed while
 `--initial-connect-required` is set, startup fails instead of reporting ready.
 
 Authentication failures are not treated like ordinary reconnectable network
-errors. If an IMAP watcher cannot obtain credentials from an auth helper, or the
-server rejects authentication, `mailwake` stops the daemon with exit status `78`.
-The packaged systemd units use `RestartPreventExitStatus=78`, so reauth/config
-failures remain visible in `systemctl --user --failed` instead of disappearing
-inside a restart loop.
+errors. If an IMAP or Gmail API watcher cannot obtain credentials from an auth
+helper, or the remote service rejects authentication/permission, `mailwake`
+stops the daemon with exit status `78`. The packaged systemd units use
+`RestartPreventExitStatus=78`, so reauth/config failures remain visible in
+`systemctl --user --failed` instead of disappearing inside a restart loop.
 
 Readiness is therefore not the same as "currently connected to Gmail" unless
 `--initial-connect-required` is used. Without that flag, network failures are

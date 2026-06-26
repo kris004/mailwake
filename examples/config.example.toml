@@ -44,6 +44,19 @@ on_event = "remote-sync"
 run_on_startup = true
 debounce_seconds = 10
 
+# Alternative for Gmail users who prefer the narrower Gmail API metadata scope
+# over true IMAP IDLE. This polls; it does not need Cloud Pub/Sub or gcloud.
+#
+# [[sources]]
+# name = "gmail-api-inbox"
+# type = "gmail_api_poll"
+# on_event = "remote-sync"
+# gmail_token_cmd = "/home/alice/.local/bin/gmail-api-token"
+# label_ids = ["INBOX"]
+# run_on_startup = true
+# debounce_seconds = 10
+# poll_interval_seconds = 60
+
 [[sources]]
 name = "system-resume"
 type = "system_resume"
