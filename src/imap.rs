@@ -210,8 +210,8 @@ async fn run_mailbox_once(context: &mut MailboxRunContext<'_>) -> Result<RunEnd,
     .await?;
     with_imap_timeout(
         context.settings.operation_timeout,
-        "SELECT",
-        select_mailbox(
+        "EXAMINE",
+        examine_mailbox(
             &mut reader,
             &mut write_half,
             &mut tags,
@@ -223,7 +223,7 @@ async fn run_mailbox_once(context: &mut MailboxRunContext<'_>) -> Result<RunEnd,
     info!(
         account = %context.account.name,
         mailbox = %context.mailbox.name,
-        "IMAP login/select succeeded; entering IDLE"
+        "IMAP login/examine succeeded; entering IDLE"
     );
     idle_forever(&mut reader, &mut write_half, &mut tags, context).await
 }
@@ -363,7 +363,7 @@ where
         })
 }
 
-async fn select_mailbox<R, W>(
+async fn examine_mailbox<R, W>(
     reader: &mut R,
     writer: &mut W,
     tags: &mut Tags,
@@ -375,9 +375,9 @@ where
 {
     validate_imap_string("mailbox name", mailbox)?;
     let tag = tags.next();
-    let command = format!("{tag} SELECT {}\r\n", quote_imap(mailbox));
+    let command = format!("{tag} EXAMINE {}\r\n", quote_imap(mailbox));
     write_raw(writer, command.as_bytes()).await?;
-    wait_tagged(reader, &tag, "SELECT").await
+    wait_tagged(reader, &tag, "EXAMINE").await
 }
 
 async fn idle_forever<R, W>(
@@ -695,6 +695,31 @@ mod tests {
         assert!(is_mailbox_change("* 2 EXPUNGE"));
         assert!(!is_mailbox_change("* OK Still here"));
         assert!(!is_mailbox_change("A0001 OK IDLE completed"));
+    }
+
+    #[tokio::test]
+    async fn mailbox_open_uses_read_only_examine() {
+        let (client, server) = tokio::io::duplex(1024);
+        let (client_read, mut client_write) = tokio::io::split(client);
+        let (server_read, mut server_write) = tokio::io::split(server);
+        let mut client_reader = BufReader::new(client_read);
+        let mut server_reader = BufReader::new(server_read);
+        let mut tags = Tags::default();
+
+        let server = tokio::spawn(async move {
+            let mut command = String::new();
+            server_reader.read_line(&mut command).await.unwrap();
+            assert_eq!(command, "A0001 EXAMINE \"INBOX\"\r\n");
+            server_write
+                .write_all(b"A0001 OK [READ-ONLY] EXAMINE completed\r\n")
+                .await
+                .unwrap();
+        });
+
+        examine_mailbox(&mut client_reader, &mut client_write, &mut tags, "INBOX")
+            .await
+            .unwrap();
+        server.await.unwrap();
     }
 
     #[test]

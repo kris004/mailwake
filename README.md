@@ -471,7 +471,7 @@ treated as secret material and is never logged.
 ## IMAP timeouts
 
 `connect_timeout_seconds` bounds TCP connect. `imap_operation_timeout_seconds`
-bounds TLS handshake, greeting read, authentication exchange, `SELECT`, IDLE
+bounds TLS handshake, greeting read, authentication exchange, `EXAMINE`, IDLE
 continuation, `DONE`, and tagged response waits. Timeout of an IMAP operation
 causes that watcher to reconnect with exponential backoff. Secrets are not
 included in timeout errors.
@@ -505,7 +505,7 @@ spawning. It does not execute OAuth/password helpers as a separate startup
 preflight; helpers run when IMAP watchers connect and are bounded by
 `auth_helper_timeout_seconds`. With `--initial-connect-required`, readiness waits
 until every watcher completes initial setup before `READY=1` (for IMAP, that
-means one successful login/select/IDLE setup; for `fs_state`, it means the
+means one successful login/examine/IDLE setup; for `fs_state`, it means the
 filesystem watcher was installed and any configured startup `state_cmd` attempt
 completed successfully; for `system_resume`, it means the systemd/logind D-Bus
 subscription is active). If an `fs_state` startup baseline fails or a

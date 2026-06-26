@@ -56,8 +56,9 @@ because static validation cannot prove the target executable.
 
 ## IMAP safety
 
-TCP connect, TLS handshake, greeting read, authentication, mailbox selection, IDLE
-continuation, DONE, and tagged response waits are bounded by config timeouts.
+TCP connect, TLS handshake, greeting read, authentication, read-only mailbox
+open, IDLE continuation, DONE, and tagged response waits are bounded by config
+timeouts.
 Network and protocol timeouts return the watcher to the reconnect/backoff loop.
 Authentication failures stop the daemon instead of leaving it running without a
 working IMAP source.
@@ -73,7 +74,7 @@ intentionally avoids a separate auth-helper execution preflight so startup does
 not double-run OAuth/password helpers. Helper execution happens in watcher tasks
 and is bounded by `auth_helper_timeout_seconds`. With `--initial-connect-required`,
 readiness also waits for every watcher to complete initial setup; for IMAP that
-means one successful login/select/IDLE setup.
+means one successful login/examine/IDLE setup.
 
 Systemd notification is opportunistic. Without `NOTIFY_SOCKET`, `mailwake` runs
 normally. Watchdog pings are sent only while the supervisor believes every source
