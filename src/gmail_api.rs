@@ -6,10 +6,18 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio::time::{Instant, sleep};
+use tracing::{debug, info, warn};
+
+use crate::state::{RuntimeState, WatcherPhase};
 
 pub const INITIAL_AUTH_FAILURE_PREFIX: &str = "Gmail API watcher authentication failed";
+const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+const MAX_BACKOFF: Duration = Duration::from_secs(300);
 
 pub type ApiFuture<T> = Pin<Box<dyn Future<Output = Result<T, GmailApiError>> + Send>>;
 
@@ -29,6 +37,22 @@ pub trait GmailApiClient: Send + Sync {
         subscription: String,
         ack_ids: Vec<String>,
     ) -> ApiFuture<()>;
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum RunEnd {
+    Shutdown,
+}
+
+pub struct GmailApiWatchTask {
+    pub source: GmailApiWatchSourceConfig,
+    pub events: mpsc::Sender<()>,
+    pub state: Arc<RuntimeState>,
+    pub watcher_id: String,
+    pub initial_ready: Option<oneshot::Sender<Result<(), String>>>,
+    pub shutdown: watch::Receiver<bool>,
+    pub settings: GmailApiSettings,
+    pub client: Arc<dyn GmailApiClient>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -83,6 +107,292 @@ impl GmailApiError {
                     ..
                 }
         )
+    }
+}
+
+pub async fn watch_gmail_api_forever(task: GmailApiWatchTask) -> Result<(), GmailApiError> {
+    let GmailApiWatchTask {
+        source,
+        events,
+        state,
+        watcher_id,
+        mut initial_ready,
+        mut shutdown,
+        settings,
+        client,
+    } = task;
+    let mut backoff = INITIAL_BACKOFF;
+
+    loop {
+        if *shutdown.borrow() {
+            break;
+        }
+
+        state.mark_watcher(&watcher_id, WatcherPhase::Connecting);
+        let run_result = run_gmail_api_once(
+            &source,
+            &events,
+            &state,
+            &watcher_id,
+            &mut initial_ready,
+            &mut shutdown,
+            settings,
+            Arc::clone(&client),
+        )
+        .await;
+        match run_result {
+            Ok(RunEnd::Shutdown) => break,
+            Err(error) if error.is_permanent_auth_failure() => {
+                let error_text = error.to_string();
+                state.mark_watcher(&watcher_id, WatcherPhase::Crashed);
+                if let Some(sender) = initial_ready.take() {
+                    let _ =
+                        sender.send(Err(format!("{INITIAL_AUTH_FAILURE_PREFIX}: {error_text}")));
+                }
+                warn!(
+                    source = %source.name,
+                    %error,
+                    "Gmail API watcher authentication or permission failure; stopping"
+                );
+                return Err(error);
+            }
+            Err(error) => {
+                warn!(
+                    source = %source.name,
+                    %error,
+                    "Gmail API watcher disconnected; reconnecting"
+                );
+            }
+        }
+
+        state.mark_watcher(&watcher_id, WatcherPhase::Reconnecting);
+        if !sleep_or_shutdown(backoff, &mut shutdown).await {
+            break;
+        }
+        backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
+    }
+
+    state.mark_watcher(&watcher_id, WatcherPhase::Stopped);
+    info!(
+        source = %source.name,
+        "Gmail API watcher stopped"
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_gmail_api_once(
+    source: &GmailApiWatchSourceConfig,
+    events: &mpsc::Sender<()>,
+    state: &Arc<RuntimeState>,
+    watcher_id: &str,
+    initial_ready: &mut Option<oneshot::Sender<Result<(), String>>>,
+    shutdown: &mut watch::Receiver<bool>,
+    settings: GmailApiSettings,
+    client: Arc<dyn GmailApiClient>,
+) -> Result<RunEnd, GmailApiError> {
+    let mut tracker = GmailHistoryTracker::default();
+    if !register_watch(
+        source,
+        events,
+        &mut tracker,
+        settings,
+        Arc::clone(&client),
+        shutdown,
+        WatchRegistrationMode::Initial,
+    )
+    .await?
+    {
+        return Ok(RunEnd::Shutdown);
+    }
+    let mut next_renewal = Instant::now() + settings.watch_renewal;
+    let mut first_pull_succeeded = false;
+
+    loop {
+        if *shutdown.borrow() {
+            return Ok(RunEnd::Shutdown);
+        }
+
+        if Instant::now() >= next_renewal {
+            state.mark_watcher(watcher_id, WatcherPhase::Connecting);
+            if !register_watch(
+                source,
+                events,
+                &mut tracker,
+                settings,
+                Arc::clone(&client),
+                shutdown,
+                WatchRegistrationMode::Renewal,
+            )
+            .await?
+            {
+                return Ok(RunEnd::Shutdown);
+            }
+            next_renewal = Instant::now() + settings.watch_renewal;
+        }
+
+        state.mark_watcher(watcher_id, WatcherPhase::Idling);
+        let Some(response) = pull_once(source, settings, Arc::clone(&client), shutdown).await?
+        else {
+            return Ok(RunEnd::Shutdown);
+        };
+        let received_count = response.received_messages.len();
+        let decision = classify_pubsub_batch(&response, &mut tracker);
+        if decision.should_trigger && !queue_event(&source.name, events) {
+            return Ok(RunEnd::Shutdown);
+        }
+        if decision.malformed_count > 0 {
+            warn!(
+                source = %source.name,
+                malformed_count = decision.malformed_count,
+                "ignored malformed Gmail Pub/Sub message(s)"
+            );
+        }
+        if !acknowledge_once(
+            source,
+            settings,
+            Arc::clone(&client),
+            decision.ack_ids,
+            shutdown,
+        )
+        .await?
+        {
+            return Ok(RunEnd::Shutdown);
+        }
+        state.mark_watcher_progress(watcher_id);
+
+        if !first_pull_succeeded {
+            first_pull_succeeded = true;
+            if let Some(sender) = initial_ready.take() {
+                let _ = sender.send(Ok(()));
+            }
+        }
+
+        if received_count == 0 && !sleep_or_shutdown(settings.empty_pull_delay, shutdown).await {
+            return Ok(RunEnd::Shutdown);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WatchRegistrationMode {
+    Initial,
+    Renewal,
+}
+
+async fn register_watch(
+    source: &GmailApiWatchSourceConfig,
+    events: &mpsc::Sender<()>,
+    tracker: &mut GmailHistoryTracker,
+    settings: GmailApiSettings,
+    client: Arc<dyn GmailApiClient>,
+    shutdown: &mut watch::Receiver<bool>,
+    mode: WatchRegistrationMode,
+) -> Result<bool, GmailApiError> {
+    let token = token_from_helper(&source.gmail_token_cmd, settings).await?;
+    let request = WatchRequest::from_source(source);
+    let response = tokio::select! {
+        result = client.watch(token, request) => result?,
+        changed = shutdown.changed() => {
+            let _ = changed;
+            return Ok(false);
+        }
+    };
+
+    match mode {
+        WatchRegistrationMode::Initial => {
+            tracker.set_baseline_from_watch(&response)?;
+            info!(
+                source = %source.name,
+                "registered Gmail API watch"
+            );
+        }
+        WatchRegistrationMode::Renewal => {
+            if tracker.observe_watch_response(&response)? && !queue_event(&source.name, events) {
+                return Ok(false);
+            }
+            info!(
+                source = %source.name,
+                "renewed Gmail API watch"
+            );
+        }
+    }
+    Ok(true)
+}
+
+async fn pull_once(
+    source: &GmailApiWatchSourceConfig,
+    settings: GmailApiSettings,
+    client: Arc<dyn GmailApiClient>,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<Option<PullResponse>, GmailApiError> {
+    let token = token_from_helper(&source.pubsub_token_cmd, settings).await?;
+    tokio::select! {
+        result = client.pull(
+            token,
+            source.subscription.clone(),
+            settings.pull_max_messages,
+        ) => result.map(Some),
+        changed = shutdown.changed() => {
+            let _ = changed;
+            Ok(None)
+        }
+    }
+}
+
+async fn acknowledge_once(
+    source: &GmailApiWatchSourceConfig,
+    settings: GmailApiSettings,
+    client: Arc<dyn GmailApiClient>,
+    ack_ids: Vec<String>,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<bool, GmailApiError> {
+    if ack_ids.is_empty() {
+        return Ok(true);
+    }
+    let token = token_from_helper(&source.pubsub_token_cmd, settings).await?;
+    tokio::select! {
+        result = client.acknowledge(token, source.subscription.clone(), ack_ids) => result.map(|()| true),
+        changed = shutdown.changed() => {
+            let _ = changed;
+            Ok(false)
+        }
+    }
+}
+
+fn queue_event(source_name: &str, events: &mpsc::Sender<()>) -> bool {
+    match events.try_send(()) {
+        Ok(()) => {
+            info!(
+                source = %source_name,
+                "queued Gmail API source event"
+            );
+            true
+        }
+        Err(mpsc::error::TrySendError::Full(())) => {
+            debug!(
+                source = %source_name,
+                "Gmail API source event queue is full; coalescing event"
+            );
+            true
+        }
+        Err(mpsc::error::TrySendError::Closed(())) => {
+            warn!(
+                source = %source_name,
+                "Gmail API source event queue is closed"
+            );
+            false
+        }
+    }
+}
+
+async fn sleep_or_shutdown(duration: Duration, shutdown: &mut watch::Receiver<bool>) -> bool {
+    if duration.is_zero() {
+        return true;
+    }
+    tokio::select! {
+        () = sleep(duration) => true,
+        changed = shutdown.changed() => !(changed.is_ok() && *shutdown.borrow()),
     }
 }
 
@@ -318,6 +628,19 @@ impl GmailHistoryTracker {
         Ok(())
     }
 
+    pub fn observe_watch_response(
+        &mut self,
+        response: &WatchResponse,
+    ) -> Result<bool, GmailApiError> {
+        let history_id = parse_history_id("watch", &response.history_id)?;
+        let should_trigger = self
+            .last_history_id
+            .map(|last| history_id > last)
+            .unwrap_or(false);
+        self.last_history_id = Some(history_id);
+        Ok(should_trigger)
+    }
+
     pub fn observe_notification(
         &mut self,
         notification: &GmailNotification,
@@ -516,6 +839,35 @@ label_filter_behavior = "include"
         let duplicate = classify_pubsub_batch(&response, &mut tracker);
         assert!(!duplicate.should_trigger);
         assert_eq!(tracker.last_history_id(), Some(101));
+    }
+
+    #[test]
+    fn watch_response_initializes_baseline_and_renewal_can_trigger() {
+        let mut tracker = GmailHistoryTracker::default();
+        tracker
+            .set_baseline_from_watch(&WatchResponse {
+                history_id: "200".to_string(),
+                expiration: "9999999999999".to_string(),
+            })
+            .expect("baseline should parse");
+        assert_eq!(tracker.last_history_id(), Some(200));
+
+        let unchanged = tracker
+            .observe_watch_response(&WatchResponse {
+                history_id: "200".to_string(),
+                expiration: "9999999999999".to_string(),
+            })
+            .expect("watch response should parse");
+        assert!(!unchanged);
+
+        let advanced = tracker
+            .observe_watch_response(&WatchResponse {
+                history_id: "205".to_string(),
+                expiration: "9999999999999".to_string(),
+            })
+            .expect("watch response should parse");
+        assert!(advanced);
+        assert_eq!(tracker.last_history_id(), Some(205));
     }
 
     #[test]
