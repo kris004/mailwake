@@ -605,6 +605,12 @@ async fn run_daemon(
                     shutdown: shutdown_rx.clone(),
                 }));
             }
+            SourceConfig::GmailApiWatch(source) => {
+                bail!(
+                    "gmail_api_watch source {:?} is parsed but not implemented yet",
+                    source.name
+                );
+            }
         }
     }
 

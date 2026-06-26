@@ -23,6 +23,10 @@ pub const DEFAULT_CONNECT_TIMEOUT_SECONDS: u64 = 30;
 pub const DEFAULT_IMAP_OPERATION_TIMEOUT_SECONDS: u64 = 60;
 pub const DEFAULT_MIN_COMMAND_INTERVAL_SECONDS: u64 = 60;
 pub const DEFAULT_SYSTEM_RESUME_SETTLE_SECONDS: u64 = 15;
+pub const DEFAULT_GMAIL_API_REQUEST_TIMEOUT_SECONDS: u64 = 60;
+pub const DEFAULT_GMAIL_WATCH_RENEWAL_SECONDS: u64 = 24 * 60 * 60;
+pub const DEFAULT_GMAIL_PUBSUB_MAX_MESSAGES: u32 = 10;
+pub const DEFAULT_GMAIL_PUBSUB_EMPTY_PULL_DELAY_SECONDS: u64 = 5;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -158,6 +162,7 @@ pub enum SourceConfig {
     ImapIdle(ImapIdleSourceConfig),
     FsState(FsStateSourceConfig),
     SystemResume(SystemResumeSourceConfig),
+    GmailApiWatch(GmailApiWatchSourceConfig),
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -198,6 +203,49 @@ pub struct SystemResumeSourceConfig {
     pub on_resume: String,
     #[serde(default)]
     pub settle_seconds: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum GmailLabelFilterBehavior {
+    Include,
+    Exclude,
+}
+
+impl fmt::Display for GmailLabelFilterBehavior {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Include => f.write_str("include"),
+            Self::Exclude => f.write_str("exclude"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GmailApiWatchSourceConfig {
+    pub name: String,
+    pub on_event: String,
+    pub gmail_token_cmd: String,
+    pub pubsub_token_cmd: String,
+    pub topic_name: String,
+    pub subscription: String,
+    #[serde(default)]
+    pub label_ids: Vec<String>,
+    #[serde(default)]
+    pub label_filter_behavior: Option<GmailLabelFilterBehavior>,
+    #[serde(default)]
+    pub run_on_startup: bool,
+    #[serde(default)]
+    pub debounce_seconds: Option<u64>,
+    #[serde(default)]
+    pub api_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub watch_renewal_seconds: Option<u64>,
+    #[serde(default)]
+    pub pull_max_messages: Option<u32>,
+    #[serde(default)]
+    pub empty_pull_delay_seconds: Option<u64>,
 }
 
 #[derive(Debug, Error)]
@@ -635,6 +683,14 @@ impl Config {
                         );
                     }
                 }
+                SourceConfig::GmailApiWatch(source) => {
+                    if source.debounce_seconds == Some(0) {
+                        warn!(
+                            source = %source.name,
+                            "debounce_seconds=0 disables debounce for this Gmail API source by explicit configuration"
+                        );
+                    }
+                }
                 SourceConfig::ImapIdle(_) => {}
             }
         }
@@ -715,6 +771,7 @@ impl SourceConfig {
             Self::ImapIdle(source) => &source.name,
             Self::FsState(source) => &source.name,
             Self::SystemResume(source) => &source.name,
+            Self::GmailApiWatch(source) => &source.name,
         }
     }
 
@@ -776,6 +833,40 @@ impl SourceConfig {
                 validate_nonempty("source on_resume", &source.on_resume)?;
                 validate_command_reference("on_resume", &source.on_resume, command_names)?;
             }
+            Self::GmailApiWatch(source) => {
+                validate_nonempty("source on_event", &source.on_event)?;
+                validate_command_reference("on_event", &source.on_event, command_names)?;
+                validate_nonempty("gmail_token_cmd", &source.gmail_token_cmd)?;
+                validate_nonempty("pubsub_token_cmd", &source.pubsub_token_cmd)?;
+                validate_google_resource_name("topic_name", &source.topic_name, "/topics/")?;
+                validate_google_resource_name(
+                    "subscription",
+                    &source.subscription,
+                    "/subscriptions/",
+                )?;
+                for label_id in &source.label_ids {
+                    validate_nonempty("label id", label_id)?;
+                    validate_no_crlf("label id", label_id)?;
+                }
+                if source.label_filter_behavior.is_some() && source.label_ids.is_empty() {
+                    return Err(ConfigError::Invalid(format!(
+                        "gmail_api_watch source {:?} sets label_filter_behavior without label_ids",
+                        source.name
+                    )));
+                }
+                if let Some(seconds) = source.api_timeout_seconds {
+                    validate_nonzero_seconds("source api_timeout_seconds", seconds)?;
+                }
+                if let Some(seconds) = source.watch_renewal_seconds {
+                    validate_nonzero_seconds("source watch_renewal_seconds", seconds)?;
+                }
+                if let Some(max_messages) = source.pull_max_messages {
+                    validate_nonzero_u32("source pull_max_messages", max_messages)?;
+                }
+                if let Some(seconds) = source.empty_pull_delay_seconds {
+                    validate_nonzero_seconds("source empty_pull_delay_seconds", seconds)?;
+                }
+            }
         }
         Ok(())
     }
@@ -812,6 +903,37 @@ impl SystemResumeSourceConfig {
         self.settle_seconds
             .map(Duration::from_secs)
             .unwrap_or_else(|| Duration::from_secs(DEFAULT_SYSTEM_RESUME_SETTLE_SECONDS))
+    }
+}
+
+impl GmailApiWatchSourceConfig {
+    pub fn debounce(&self, config: &Config) -> Duration {
+        self.debounce_seconds
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| config.default_debounce())
+    }
+
+    pub fn api_timeout(&self) -> Duration {
+        self.api_timeout_seconds
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| Duration::from_secs(DEFAULT_GMAIL_API_REQUEST_TIMEOUT_SECONDS))
+    }
+
+    pub fn watch_renewal(&self) -> Duration {
+        self.watch_renewal_seconds
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| Duration::from_secs(DEFAULT_GMAIL_WATCH_RENEWAL_SECONDS))
+    }
+
+    pub fn pull_max_messages(&self) -> u32 {
+        self.pull_max_messages
+            .unwrap_or(DEFAULT_GMAIL_PUBSUB_MAX_MESSAGES)
+    }
+
+    pub fn empty_pull_delay(&self) -> Duration {
+        self.empty_pull_delay_seconds
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| Duration::from_secs(DEFAULT_GMAIL_PUBSUB_EMPTY_PULL_DELAY_SECONDS))
     }
 }
 
@@ -852,6 +974,42 @@ fn validate_nonzero_seconds(field: &str, value: u64) -> Result<(), ConfigError> 
     if value == 0 {
         return Err(ConfigError::Invalid(format!(
             "{field} must be greater than 0 seconds"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_nonzero_u32(field: &str, value: u32) -> Result<(), ConfigError> {
+    if value == 0 {
+        return Err(ConfigError::Invalid(format!(
+            "{field} must be greater than 0"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_google_resource_name(
+    field: &str,
+    value: &str,
+    required_segment: &str,
+) -> Result<(), ConfigError> {
+    validate_nonempty(field, value)?;
+    if value
+        .chars()
+        .any(|ch| ch.is_control() || ch.is_whitespace())
+    {
+        return Err(ConfigError::Invalid(format!(
+            "{field} must not contain whitespace or control characters"
+        )));
+    }
+    if value.contains('?') || value.contains('#') {
+        return Err(ConfigError::Invalid(format!(
+            "{field} must not contain URL query or fragment characters"
+        )));
+    }
+    if !value.starts_with("projects/") || !value.contains(required_segment) {
+        return Err(ConfigError::Invalid(format!(
+            "{field} must be a fully qualified Google resource name containing {required_segment:?}"
         )));
     }
     Ok(())
@@ -1392,6 +1550,158 @@ on_resume = "wake-command"
             source.settle().as_secs(),
             DEFAULT_SYSTEM_RESUME_SETTLE_SECONDS
         );
+    }
+
+    #[test]
+    fn parses_gmail_api_watch_source() {
+        let config = Config::parse_str(
+            r#"
+default_debounce_seconds = 10
+
+[[commands]]
+name = "remote-sync"
+cmd = "echo sync"
+
+[[sources]]
+name = "gmail-inbox"
+type = "gmail_api_watch"
+on_event = "remote-sync"
+gmail_token_cmd = "/home/alice/.local/bin/gmail-api-token"
+pubsub_token_cmd = "/home/alice/.local/bin/google-pubsub-token"
+topic_name = "projects/example-project/topics/mailwake-gmail"
+subscription = "projects/example-project/subscriptions/mailwake-gmail"
+label_ids = ["INBOX"]
+label_filter_behavior = "include"
+run_on_startup = true
+debounce_seconds = 5
+api_timeout_seconds = 45
+watch_renewal_seconds = 3600
+pull_max_messages = 3
+empty_pull_delay_seconds = 2
+"#,
+        )
+        .expect("gmail_api_watch config should parse");
+
+        let SourceConfig::GmailApiWatch(source) = &config.sources[0] else {
+            panic!("source should be gmail_api_watch");
+        };
+        assert_eq!(source.name, "gmail-inbox");
+        assert_eq!(source.on_event, "remote-sync");
+        assert_eq!(source.label_ids, ["INBOX"]);
+        assert_eq!(
+            source.label_filter_behavior,
+            Some(GmailLabelFilterBehavior::Include)
+        );
+        assert!(source.run_on_startup);
+        assert_eq!(source.debounce(&config).as_secs(), 5);
+        assert_eq!(source.api_timeout().as_secs(), 45);
+        assert_eq!(source.watch_renewal().as_secs(), 3600);
+        assert_eq!(source.pull_max_messages(), 3);
+        assert_eq!(source.empty_pull_delay().as_secs(), 2);
+        assert_eq!(config.source_count(), 1);
+        assert_eq!(config.command_count(), 1);
+    }
+
+    #[test]
+    fn gmail_api_watch_defaults_are_conservative() {
+        let config = Config::parse_str(
+            r#"
+[[commands]]
+name = "remote-sync"
+cmd = "echo sync"
+
+[[sources]]
+name = "gmail-inbox"
+type = "gmail_api_watch"
+on_event = "remote-sync"
+gmail_token_cmd = "gmail-api-token"
+pubsub_token_cmd = "google-pubsub-token"
+topic_name = "projects/example-project/topics/mailwake-gmail"
+subscription = "projects/example-project/subscriptions/mailwake-gmail"
+"#,
+        )
+        .expect("minimal gmail_api_watch config should parse");
+
+        let SourceConfig::GmailApiWatch(source) = &config.sources[0] else {
+            panic!("source should be gmail_api_watch");
+        };
+        assert!(source.label_ids.is_empty());
+        assert_eq!(source.label_filter_behavior, None);
+        assert!(!source.run_on_startup);
+        assert_eq!(source.debounce(&config), config.default_debounce());
+        assert_eq!(
+            source.api_timeout(),
+            Duration::from_secs(DEFAULT_GMAIL_API_REQUEST_TIMEOUT_SECONDS)
+        );
+        assert_eq!(
+            source.watch_renewal(),
+            Duration::from_secs(DEFAULT_GMAIL_WATCH_RENEWAL_SECONDS)
+        );
+        assert_eq!(
+            source.pull_max_messages(),
+            DEFAULT_GMAIL_PUBSUB_MAX_MESSAGES
+        );
+        assert_eq!(
+            source.empty_pull_delay(),
+            Duration::from_secs(DEFAULT_GMAIL_PUBSUB_EMPTY_PULL_DELAY_SECONDS)
+        );
+    }
+
+    #[test]
+    fn gmail_api_watch_validates_command_and_resource_names() {
+        let missing_command = Config::parse_str(
+            r#"
+[[sources]]
+name = "gmail-inbox"
+type = "gmail_api_watch"
+on_event = "missing"
+gmail_token_cmd = "gmail-api-token"
+pubsub_token_cmd = "google-pubsub-token"
+topic_name = "projects/example-project/topics/mailwake-gmail"
+subscription = "projects/example-project/subscriptions/mailwake-gmail"
+"#,
+        )
+        .expect_err("missing command reference should fail");
+        assert!(missing_command.to_string().contains("unknown command"));
+
+        let bad_topic = Config::parse_str(
+            r#"
+[[commands]]
+name = "remote-sync"
+cmd = "echo sync"
+
+[[sources]]
+name = "gmail-inbox"
+type = "gmail_api_watch"
+on_event = "remote-sync"
+gmail_token_cmd = "gmail-api-token"
+pubsub_token_cmd = "google-pubsub-token"
+topic_name = "not-a-topic"
+subscription = "projects/example-project/subscriptions/mailwake-gmail"
+"#,
+        )
+        .expect_err("invalid topic resource should fail");
+        assert!(bad_topic.to_string().contains("topic_name"));
+
+        let empty_label = Config::parse_str(
+            r#"
+[[commands]]
+name = "remote-sync"
+cmd = "echo sync"
+
+[[sources]]
+name = "gmail-inbox"
+type = "gmail_api_watch"
+on_event = "remote-sync"
+gmail_token_cmd = "gmail-api-token"
+pubsub_token_cmd = "google-pubsub-token"
+topic_name = "projects/example-project/topics/mailwake-gmail"
+subscription = "projects/example-project/subscriptions/mailwake-gmail"
+label_ids = [""]
+"#,
+        )
+        .expect_err("empty label id should fail");
+        assert!(empty_label.to_string().contains("label id"));
     }
 
     #[test]
