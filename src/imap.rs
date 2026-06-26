@@ -16,6 +16,7 @@ use tracing::{debug, info, warn};
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
+pub const INITIAL_AUTH_FAILURE_PREFIX: &str = "IMAP watcher authentication failed";
 
 #[derive(Clone, Copy, Debug)]
 pub struct WatcherSettings {
@@ -55,6 +56,12 @@ pub enum ImapError {
     UnsafeImapString { field: &'static str },
 }
 
+impl ImapError {
+    pub fn is_permanent_auth_failure(&self) -> bool {
+        matches!(self, Self::Auth(_) | Self::AuthRejected)
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 enum RunEnd {
     Shutdown,
@@ -83,7 +90,7 @@ pub struct MailboxWatchTask {
     pub settings: WatcherSettings,
 }
 
-pub async fn watch_mailbox_forever(task: MailboxWatchTask) {
+pub async fn watch_mailbox_forever(task: MailboxWatchTask) -> Result<(), ImapError> {
     let MailboxWatchTask {
         account,
         mailbox,
@@ -119,6 +126,21 @@ pub async fn watch_mailbox_forever(task: MailboxWatchTask) {
         };
         match run_result {
             Ok(RunEnd::Shutdown) => break,
+            Err(error) if error.is_permanent_auth_failure() => {
+                let error_text = error.to_string();
+                state.mark_watcher(&watcher_id, WatcherPhase::Crashed);
+                if let Some(sender) = initial_ready.take() {
+                    let _ =
+                        sender.send(Err(format!("{INITIAL_AUTH_FAILURE_PREFIX}: {error_text}")));
+                }
+                warn!(
+                    account = %account.name,
+                    mailbox = %mailbox.name,
+                    %error,
+                    "IMAP watcher authentication failed; stopping"
+                );
+                return Err(error);
+            }
             Err(error) => {
                 warn!(
                     account = %account.name,
@@ -145,6 +167,7 @@ pub async fn watch_mailbox_forever(task: MailboxWatchTask) {
         mailbox = %mailbox.name,
         "IMAP watcher stopped"
     );
+    Ok(())
 }
 
 async fn run_mailbox_once(context: &mut MailboxRunContext<'_>) -> Result<RunEnd, ImapError> {

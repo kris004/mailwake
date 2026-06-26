@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
 
+pub const REAUTH_REQUIRED_EXIT_CODE: u8 = 78;
+
 #[derive(Clone)]
 pub enum Credentials {
     Xoauth2 { token: SecretString },
@@ -33,6 +35,8 @@ pub enum AuthError {
     },
     #[error("auth helper failed with {status}")]
     HelperFailed { status: String },
+    #[error("auth helper reported that reauthorization is required")]
+    HelperReauthRequired,
     #[error("auth helper timed out after {seconds} seconds")]
     HelperTimedOut { seconds: u64 },
     #[error("auth helper wrote more than {limit} bytes to stdout")]
@@ -152,6 +156,9 @@ pub async fn run_secret_command(
     };
 
     if !output.status.success() {
+        if output.status.code() == Some(i32::from(REAUTH_REQUIRED_EXIT_CODE)) {
+            return Err(AuthError::HelperReauthRequired);
+        }
         return Err(AuthError::HelperFailed {
             status: describe_status(output.status),
         });
@@ -347,6 +354,21 @@ mod tests {
         .expect_err("helper should fail");
         let text = err.to_string();
         assert!(text.contains("exit status 42"));
+        assert!(!text.contains("super-secret"));
+    }
+
+    #[tokio::test]
+    async fn auth_helper_reauth_exit_code_is_classified_without_output() {
+        let err = run_secret_command(
+            "printf 'super-secret'; exit 78",
+            Duration::from_secs(1),
+            MAX_SECRET_OUTPUT,
+        )
+        .await
+        .expect_err("helper should report reauth required");
+        assert!(matches!(err, AuthError::HelperReauthRequired));
+        let text = err.to_string();
+        assert!(text.contains("reauthorization is required"));
         assert!(!text.contains("super-secret"));
     }
 

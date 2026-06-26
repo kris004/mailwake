@@ -2,15 +2,18 @@
 Description=mailwake event-driven command trigger
 Wants=network-online.target
 After=network-online.target
+StartLimitIntervalSec=15min
+StartLimitBurst=3
 
 [Service]
 Type=notify
-ExecStart=%h/.cargo/bin/mailwake --config %h/.config/mailwake/config.toml
+ExecStart=%h/.local/bin/mailwake --config %h/.config/mailwake/config.toml
 # If auth helpers or sync tools are found through ~/.local/bin, and your
 # systemd user manager does not inherit that PATH, uncomment this:
 # Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
-Restart=always
+Restart=on-failure
 RestartSec=10
+RestartPreventExitStatus=78
 WatchdogSec=2min
 TimeoutStartSec=30s
 

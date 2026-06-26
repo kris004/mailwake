@@ -21,6 +21,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
+use thiserror::Error;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, timeout};
@@ -88,9 +89,29 @@ async fn main() -> ExitCode {
     match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
+            let exit_code = error
+                .downcast_ref::<CodedExitError>()
+                .map(|error| ExitCode::from(error.code))
+                .unwrap_or(ExitCode::FAILURE);
             error!(%error, "mailwake failed");
             eprintln!("error: {error}");
-            ExitCode::FAILURE
+            exit_code
+        }
+    }
+}
+
+#[derive(Clone, Debug, Error)]
+#[error("{message}")]
+struct CodedExitError {
+    code: u8,
+    message: String,
+}
+
+impl CodedExitError {
+    fn permanent_auth(message: impl Into<String>) -> Self {
+        Self {
+            code: auth::REAUTH_REQUIRED_EXIT_CODE,
+            message: message.into(),
         }
     }
 }
@@ -329,6 +350,7 @@ async fn run_daemon(
     let notifier = Notifier::from_env(systemd_enabled);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (startup_tx, startup_rx) = watch::channel(false);
+    let (fatal_tx, mut fatal_rx) = mpsc::unbounded_channel::<CodedExitError>();
     let mut initial_receivers: Vec<oneshot::Receiver<Result<(), String>>> = Vec::new();
     let mut task_handles = Vec::new();
     let mut command_senders = HashMap::new();
@@ -401,22 +423,25 @@ async fn run_daemon(
             } else {
                 None
             };
-            task_handles.push(spawn_watcher(ImapWatcherTask {
-                account: account.clone(),
-                mailbox,
-                event_tx,
-                state: Arc::clone(&state),
-                watcher_id,
-                initial_ready,
-                shutdown: shutdown_rx.clone(),
-                settings: mailwake::imap::WatcherSettings {
-                    idle_refresh: config.idle_refresh(),
-                    auth_helper_timeout: config.auth_helper_timeout(),
-                    auth_helper_max_output_bytes: config.auth_helper_max_output_bytes(),
-                    connect_timeout: config.connect_timeout(),
-                    operation_timeout: config.imap_operation_timeout(),
+            task_handles.push(spawn_watcher(
+                ImapWatcherTask {
+                    account: account.clone(),
+                    mailbox,
+                    event_tx,
+                    state: Arc::clone(&state),
+                    watcher_id,
+                    initial_ready,
+                    shutdown: shutdown_rx.clone(),
+                    settings: mailwake::imap::WatcherSettings {
+                        idle_refresh: config.idle_refresh(),
+                        auth_helper_timeout: config.auth_helper_timeout(),
+                        auth_helper_max_output_bytes: config.auth_helper_max_output_bytes(),
+                        connect_timeout: config.connect_timeout(),
+                        operation_timeout: config.imap_operation_timeout(),
+                    },
                 },
-            }));
+                fatal_tx.clone(),
+            ));
         }
     }
 
@@ -476,22 +501,25 @@ async fn run_daemon(
                     on_notify: String::new(),
                     debounce_seconds: source.debounce_seconds,
                 };
-                task_handles.push(spawn_watcher(ImapWatcherTask {
-                    account,
-                    mailbox,
-                    event_tx,
-                    state: Arc::clone(&state),
-                    watcher_id,
-                    initial_ready,
-                    shutdown: shutdown_rx.clone(),
-                    settings: mailwake::imap::WatcherSettings {
-                        idle_refresh: config.idle_refresh(),
-                        auth_helper_timeout: config.auth_helper_timeout(),
-                        auth_helper_max_output_bytes: config.auth_helper_max_output_bytes(),
-                        connect_timeout: config.connect_timeout(),
-                        operation_timeout: config.imap_operation_timeout(),
+                task_handles.push(spawn_watcher(
+                    ImapWatcherTask {
+                        account,
+                        mailbox,
+                        event_tx,
+                        state: Arc::clone(&state),
+                        watcher_id,
+                        initial_ready,
+                        shutdown: shutdown_rx.clone(),
+                        settings: mailwake::imap::WatcherSettings {
+                            idle_refresh: config.idle_refresh(),
+                            auth_helper_timeout: config.auth_helper_timeout(),
+                            auth_helper_max_output_bytes: config.auth_helper_max_output_bytes(),
+                            connect_timeout: config.connect_timeout(),
+                            operation_timeout: config.imap_operation_timeout(),
+                        },
                     },
-                }));
+                    fatal_tx.clone(),
+                ));
             }
             SourceConfig::FsState(source) => {
                 let watcher_id = source.name.clone();
@@ -586,7 +614,27 @@ async fn run_daemon(
             tokio::select! {
                 result = ready => match result.context("watcher stopped before initial setup completed")? {
                     Ok(()) => {}
-                    Err(error) => bail!("initial watcher setup failed: {error}"),
+                    Err(error) => {
+                        if error.starts_with(mailwake::imap::INITIAL_AUTH_FAILURE_PREFIX) {
+                            return Err(CodedExitError::permanent_auth(format!(
+                                "initial watcher setup failed: {error}"
+                            ))
+                            .into());
+                        }
+                        bail!("initial watcher setup failed: {error}");
+                    }
+                },
+                fatal = fatal_rx.recv() => {
+                    let fatal = fatal.context("fatal watcher channel closed")?;
+                    let _ = shutdown_tx.send(true);
+                    let _ = notifier.stopping();
+                    await_task_shutdown(
+                        task_handles,
+                        std::cmp::max(config.imap_operation_timeout(), max_command_timeout)
+                            + Duration::from_secs(5),
+                    )
+                    .await;
+                    return Err(fatal.into());
                 },
                 _ = wait_for_shutdown_signal() => {
                     let _ = shutdown_tx.send(true);
@@ -623,8 +671,26 @@ async fn run_daemon(
         shutdown_rx.clone(),
     ));
 
-    wait_for_shutdown_signal().await;
-    info!("shutdown requested");
+    tokio::select! {
+        () = wait_for_shutdown_signal() => {
+            info!("shutdown requested");
+        }
+        fatal = fatal_rx.recv() => {
+            let fatal = fatal.context("fatal watcher channel closed")?;
+            error!(%fatal, "fatal watcher failure");
+            let _ = shutdown_tx.send(true);
+            if let Err(error) = notifier.stopping() {
+                warn!(%error, "failed to send systemd STOPPING notification");
+            }
+            await_task_shutdown(
+                task_handles,
+                std::cmp::max(config.imap_operation_timeout(), max_command_timeout)
+                    + Duration::from_secs(5),
+            )
+            .await;
+            return Err(fatal.into());
+        }
+    }
     let _ = shutdown_tx.send(true);
     if let Err(error) = notifier.stopping() {
         warn!(%error, "failed to send systemd STOPPING notification");
@@ -845,7 +911,10 @@ struct ImapWatcherTask {
     settings: mailwake::imap::WatcherSettings,
 }
 
-fn spawn_watcher(task: ImapWatcherTask) -> JoinHandle<()> {
+fn spawn_watcher(
+    task: ImapWatcherTask,
+    fatal_tx: mpsc::UnboundedSender<CodedExitError>,
+) -> JoinHandle<()> {
     let state = Arc::clone(&task.state);
     let watcher_id = task.watcher_id.clone();
     let account_name = task.account.name.clone();
@@ -861,18 +930,34 @@ fn spawn_watcher(task: ImapWatcherTask) -> JoinHandle<()> {
             shutdown: task.shutdown,
             settings: task.settings,
         })
-        .await;
+        .await
     });
 
     tokio::spawn(async move {
-        if let Err(error) = handle.await {
-            state.mark_watcher(&watcher_id, WatcherPhase::Crashed);
-            error!(
-                account = %account_name,
-                mailbox = %mailbox_name,
-                %error,
-                "IMAP watcher task crashed"
-            );
+        match handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                state.mark_watcher(&watcher_id, WatcherPhase::Crashed);
+                let message = format!(
+                    "IMAP watcher for account {account_name:?} mailbox {mailbox_name:?} stopped after an authentication failure: {error}"
+                );
+                error!(
+                    account = %account_name,
+                    mailbox = %mailbox_name,
+                    %error,
+                    "IMAP watcher stopped after an authentication failure"
+                );
+                let _ = fatal_tx.send(CodedExitError::permanent_auth(message));
+            }
+            Err(error) => {
+                state.mark_watcher(&watcher_id, WatcherPhase::Crashed);
+                error!(
+                    account = %account_name,
+                    mailbox = %mailbox_name,
+                    %error,
+                    "IMAP watcher task crashed"
+                );
+            }
         }
     })
 }

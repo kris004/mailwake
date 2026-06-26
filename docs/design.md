@@ -41,6 +41,12 @@ these helpers. Helper output is capped by `auth_helper_max_output_bytes`; if the
 cap is exceeded, the helper process group is killed and no output is included in
 the error. OAuth refresh belongs in the helper, not in the daemon.
 
+Auth failures are fail-stop, not reconnect-loop events. Helper failures and IMAP
+authentication rejection stop the daemon so an operator can see and fix the
+problem. A helper may exit `78` to classify the failure as "user action or
+reauthorization required"; the daemon propagates that exit status so supervisors
+can avoid useless restarts.
+
 Direct `password` exists only for local testing and intentionally emits a warning
 without printing the password value.
 
@@ -52,7 +58,9 @@ because static validation cannot prove the target executable.
 
 TCP connect, TLS handshake, greeting read, authentication, mailbox selection, IDLE
 continuation, DONE, and tagged response waits are bounded by config timeouts.
-Timeouts return the watcher to the reconnect/backoff loop.
+Network and protocol timeouts return the watcher to the reconnect/backoff loop.
+Authentication failures stop the daemon instead of leaving it running without a
+working IMAP source.
 
 Usernames, mailbox names, and direct LOGIN passwords containing CR/LF are
 rejected before command construction. This keeps IMAP command strings single-line

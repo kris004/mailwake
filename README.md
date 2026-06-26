@@ -45,7 +45,9 @@ refresh OAuth tokens before Gmail is reachable. Helpers run with
 `auth_helper_timeout_seconds`; if they time out or exceed
 `auth_helper_max_output_bytes`, `mailwake` terminates the helper's Unix process
 group so helper children are not left behind. OAuth token storage and refresh
-should be handled by the helper command.
+should be handled by the helper command. If an auth helper exits with status
+`78`, `mailwake` treats that as a user-action-required auth failure, exits with
+status `78`, and lets systemd keep the unit failed instead of retrying forever.
 
 For Gmail, prefer `xoauth2_cmd`. App-password based accounts can use
 `password_cmd`. A full OAuth browser/device-code flow is intentionally outside
@@ -434,7 +436,11 @@ rm /tmp/gmail-token-test
 The wrapper uses the IMAP/SMTP Gmail scope `https://mail.google.com/`, stores the
 OAuth client JSON under `~/.config/mailwake/`, and stores the `oauth2l` token
 cache under `~/.local/state/mailwake/` instead of oauth2l's default `~/.oauth2l`
-file. Run `--setup` interactively once before starting the systemd service.
+file. Run `--setup` interactively once before starting the systemd service. If
+Google reports that the cached refresh token is expired or revoked, the wrapper
+exits `78`. The wrapper also supports `--reauth` for systemd failure hooks: it
+resets the token cache, runs the OAuth flow, and suppresses token output so
+successful reauth does not write access tokens to the journal.
 
 For the legacy mailbox config shape, make the mailbox command run your existing
 sync/index path:
@@ -506,6 +512,13 @@ subscription is active). If an `fs_state` startup baseline fails or a
 `system_resume` D-Bus subscription cannot be installed while
 `--initial-connect-required` is set, startup fails instead of reporting ready.
 
+Authentication failures are not treated like ordinary reconnectable network
+errors. If an IMAP watcher cannot obtain credentials from an auth helper, or the
+server rejects authentication, `mailwake` stops the daemon with exit status `78`.
+The packaged systemd units use `RestartPreventExitStatus=78`, so reauth/config
+failures remain visible in `systemctl --user --failed` instead of disappearing
+inside a restart loop.
+
 Readiness is therefore not the same as "currently connected to Gmail" unless
 `--initial-connect-required` is used. Without that flag, network failures are
 handled by the reconnect loop after the service is considered ready.
@@ -517,6 +530,10 @@ progressing through expected reconnect/setup work. Command lanes must be alive
 and must not have a command running past its configured timeout. If a task
 crashes, appears stale, or wedges, watchdog pings stop so systemd can restart
 the service.
+
+The example units also include a bounded start limit. Unexpected non-`78`
+failures can restart, but repeated failures eventually leave the service in a
+failed state so desktop health checks can see it.
 
 If `NOTIFY_SOCKET` and `WATCHDOG_USEC` are absent, `mailwake` runs normally from a
 terminal, cron, OpenRC, or anything else.
