@@ -20,7 +20,7 @@ events.
 - `fs_state` watchers use `notify` as a wake-up signal. Filesystem events are
   coalesced before an optional opaque `state_cmd` comparison.
 - Gmail API poll watchers use metadata/history ids as a wake-up signal without
-  reading message bodies or managing Cloud Pub/Sub resources.
+  reading message bodies or managing provider-side notification resources.
 - IMAP source debounce, Gmail API history advancement, and fs_state state
   comparison submit command requests to command lanes.
 - Commands in the same lane are serialized and repeated requests for the same
@@ -80,8 +80,8 @@ history id and, when label filters are configured, `users.history.list` to check
 whether changed history intersects those labels. It does not call Gmail APIs
 that read message bodies, send mail, modify mail, or delete mail.
 
-The source is deliberately local-only: it does not create Cloud Pub/Sub topics,
-does not use a shared backend, and does not manage OAuth client registration.
+The source is deliberately local-only: it only calls Gmail HTTPS APIs from the
+daemon and does not manage OAuth client registration.
 If Gmail reports that the stored history baseline is too old, the source emits
 one wake-up event and rebaselines so the external sync command can repair local
 state.

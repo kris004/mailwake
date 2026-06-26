@@ -55,7 +55,7 @@ retrying forever.
 For Gmail, `imap_idle` with `xoauth2_cmd` is the true event-driven option but
 uses Google's broad IMAP/SMTP Gmail scope. `gmail_api_poll` is the lower-scope
 local option; it uses Gmail API metadata/history polling and does not require
-Cloud Pub/Sub, `gcloud`, or a hosted backend. App-password based accounts can
+any Google Cloud setup. App-password based accounts can
 use `password_cmd`. A full OAuth browser/device-code flow is intentionally
 outside this daemon.
 
@@ -295,8 +295,7 @@ source-owned command.
 ## `gmail_api_poll` sources
 
 `gmail_api_poll` is the local-only Gmail API source for users who want narrower
-OAuth than Gmail IMAP but do not want every install to set up Cloud Pub/Sub. It
-uses the Gmail API metadata scope:
+OAuth than Gmail IMAP. It uses the Gmail API metadata scope:
 
 ```text
 https://www.googleapis.com/auth/gmail.metadata

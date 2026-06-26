@@ -45,7 +45,7 @@ run_on_startup = true
 debounce_seconds = 10
 
 # Alternative for Gmail users who prefer the narrower Gmail API metadata scope
-# over true IMAP IDLE. This polls; it does not need Cloud Pub/Sub or gcloud.
+# over true IMAP IDLE. This polls locally and needs no Google Cloud setup.
 #
 # [[sources]]
 # name = "gmail-api-inbox"
