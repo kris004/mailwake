@@ -1,8 +1,8 @@
 # Gmail API watch source plan
 
-This is a staged implementation plan for adding a Gmail-specific watch source to
-`mailwake` without changing the generic IMAP source. The goal is to avoid using
-Gmail IMAP XOAUTH2 just to receive wake-up notifications.
+This documents the staged implementation plan used to add a Gmail-specific watch
+source to `mailwake` without changing the generic IMAP source. The goal is to
+avoid using Gmail IMAP XOAUTH2 just to receive wake-up notifications.
 
 ## Goal
 
@@ -35,7 +35,7 @@ The Gmail API source will still need Pub/Sub access for the subscription pull an
 ack path. That token should be supplied by a helper too, rather than stored by
 `mailwake`.
 
-## Proposed config shape
+## Implemented config shape
 
 ```toml
 [[commands]]
@@ -56,8 +56,7 @@ run_on_startup = true
 debounce_seconds = 10
 ```
 
-The exact field names can still change during implementation, but the source
-should stay self-contained and should not reuse IMAP account configuration.
+The source stays self-contained and does not reuse IMAP account configuration.
 
 ## Implementation slices and gates
 

@@ -8,9 +8,9 @@ commands.
 event source -> debounce/coalesce/cooldown -> command lane -> run configured command
 ```
 
-IMAP IDLE, `fs_state`, and `system_resume` are source types. The daemon
-intentionally treats all source events as wake-up signals, not as work-item
-queues.
+IMAP IDLE, Gmail API watch, `fs_state`, and `system_resume` are source
+types. The daemon intentionally treats all source events as wake-up signals, not
+as work-item queues.
 
 ## Non-goals
 
@@ -19,7 +19,7 @@ queues.
 - sync mail directly;
 - store mail;
 - implement a mail client;
-- know about lieer, notmuch, mbsync, Gmail labels, Maildir, or aerc internals;
+- know about lieer, notmuch, mbsync, Maildir, or aerc internals;
 - implement a browser/device-code OAuth flow;
 - act as a general automation framework;
 - recursively crawl or sync local filesystem trees;
@@ -49,9 +49,10 @@ should be handled by the helper command. If an auth helper exits with status
 `78`, `mailwake` treats that as a user-action-required auth failure, exits with
 status `78`, and lets systemd keep the unit failed instead of retrying forever.
 
-For Gmail, prefer `xoauth2_cmd`. App-password based accounts can use
-`password_cmd`. A full OAuth browser/device-code flow is intentionally outside
-this daemon.
+For Gmail over IMAP, prefer `xoauth2_cmd`. App-password based IMAP accounts
+can use `password_cmd`. The Gmail API watch source uses bearer-token helper
+commands for Gmail and Pub/Sub API calls. A full OAuth browser/device-code flow
+is intentionally outside this daemon.
 
 ## TLS defaults
 
@@ -79,7 +80,7 @@ Default config path:
 ~/.config/mailwake/config.toml
 ```
 
-Preferred Gmail XOAUTH2 example:
+IMAP XOAUTH2 example:
 
 ```toml
 default_debounce_seconds = 10
@@ -119,6 +120,35 @@ debounce_seconds = 10
 
 Each configured mailbox gets its own IMAP connection so it can remain selected
 and in IDLE independently.
+
+Gmail API watch example:
+
+```toml
+[[commands]]
+name = "remote-sync"
+lane = "example-sync"
+cmd = "cd /home/alice/.mail/example && flock -n .sync.lock sync-command"
+
+[[sources]]
+name = "gmail-inbox"
+type = "gmail_api_watch"
+on_event = "remote-sync"
+gmail_token_cmd = "/home/alice/.local/bin/gmail-api-token"
+pubsub_token_cmd = "/home/alice/.local/bin/google-pubsub-token"
+topic_name = "projects/example-project/topics/mailwake-gmail"
+subscription = "projects/example-project/subscriptions/mailwake-gmail"
+label_ids = ["INBOX"]
+label_filter_behavior = "include"
+run_on_startup = true
+debounce_seconds = 10
+```
+
+The Gmail API source uses `https://www.googleapis.com/auth/gmail.metadata` for
+Gmail mailbox-change notifications and a Pub/Sub token for pulling and
+acknowledging subscription messages. It does not request the broad Gmail
+IMAP/SMTP scope unless your token helper does so. Create the Google Cloud topic
+and subscription outside `mailwake`, then point the source at their fully
+qualified resource names.
 
 Useful global knobs:
 
@@ -249,9 +279,9 @@ run_on_startup = false
 debounce_seconds = 10
 ```
 
-The `imap_idle` and `fs_state` source types can also set
+The `imap_idle`, `gmail_api_watch`, and `fs_state` source types can also set
 `run_on_startup = true` to queue their normal configured command once when the
-daemon starts. This is generic: `imap_idle` sources queue `on_event`, and
+daemon starts. This is generic: IMAP and Gmail API sources queue `on_event`, and
 `fs_state` sources queue `on_change`. Startup commands use the same command
 lanes, timeouts, cooldowns, and coalescing as event-triggered commands; commands
 in the same lane still do not overlap.
@@ -262,6 +292,43 @@ in the same lane still do not overlap.
 the startup command runs. If that command changes watched paths, `fs_state`
 uses the same self-trigger suppression and rebaseline behavior as a normal
 source-owned command.
+
+## `gmail_api_watch` sources
+
+`gmail_api_watch` is a Gmail-specific wake source for users who do not want to
+use the broad Gmail IMAP/SMTP OAuth scope just to notice mailbox changes. It
+registers a Gmail API `users.watch` request, pulls notifications from a Cloud
+Pub/Sub subscription, compares Gmail `historyId` values, and submits the
+configured `on_event` command when a newer history id is observed.
+
+It treats notifications as wake-up signals only. It does not fetch message
+bodies, list messages, sync mail, or interpret what changed. Duplicate and
+out-of-order Pub/Sub messages are coalesced by history id before they reach the
+normal debounce runner. Malformed Pub/Sub messages are acknowledged so a broken
+message does not loop forever, but their payload is not logged.
+
+Required external pieces:
+
+- a Gmail bearer-token helper scoped for
+  `https://www.googleapis.com/auth/gmail.metadata`;
+- a Pub/Sub bearer-token helper scoped for Pub/Sub pull/ack access;
+- a Cloud Pub/Sub topic that Gmail may publish to;
+- a pull subscription for `mailwake` to consume.
+
+Useful source knobs:
+
+```toml
+api_timeout_seconds = 60
+watch_renewal_seconds = 86400
+pull_max_messages = 10
+empty_pull_delay_seconds = 30
+```
+
+`watch_renewal_seconds` controls how often `mailwake` renews the Gmail watch;
+Gmail watches expire and must be renewed periodically. Renewal is unrelated to
+OAuth refresh-token lifetime. If a renewal response reports a newer history id
+than the last accepted notification, `mailwake` queues one event so delayed or
+missed Pub/Sub delivery still wakes the command lane.
 
 ## `fs_state` sources
 
@@ -377,11 +444,12 @@ commands. More complex helper commands using shell syntax such as `~`, pipes,
 redirection, `&&`, or `;` are not rejected just because static validation cannot
 prove the executable path.
 
-Prefer absolute paths for `xoauth2_cmd` and `password_cmd`, especially under
-systemd. A user service may not inherit the same `PATH` as your interactive
-shell, so a helper that works in a terminal as `gmail-oauth-token` may fail in
-the service unless configured as `/home/alice/.local/bin/gmail-oauth-token`
-or the service explicitly sets a suitable `PATH`.
+Prefer absolute paths for `xoauth2_cmd`, `password_cmd`, `gmail_token_cmd`, and
+`pubsub_token_cmd`, especially under systemd. A user service may not inherit the
+same `PATH` as your interactive shell, so a helper that works in a terminal as
+`gmail-oauth-token` may fail in the service unless configured as
+`/home/alice/.local/bin/gmail-oauth-token` or the service explicitly sets a
+suitable `PATH`.
 
 `test-command --command NAME` runs a named `[[commands]]` entry with its
 configured timeout. The legacy `test-command --account NAME --mailbox NAME`
@@ -408,10 +476,10 @@ with your own values before use.
 ## Gmail + lieer + notmuch
 
 This is an example recipe, not the purpose of the tool. `mailwake` does not
-understand Gmail, lieer, notmuch, Maildir, labels, or email semantics; it only
-turns source events into command runs.
+understand lieer, notmuch, Maildir, or email semantics; it only turns source
+events into command runs.
 
-Use a Gmail OAuth helper that prints a valid bearer token:
+For Gmail IMAP, use an OAuth helper that prints a valid bearer token:
 
 ```toml
 auth = "xoauth2_cmd"
@@ -496,16 +564,18 @@ this in the service:
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 ```
 
-Absolute paths in `xoauth2_cmd`/`password_cmd` are still preferred because they
-make `check-config` and service startup behavior more predictable.
+Absolute paths in `xoauth2_cmd`, `password_cmd`, `gmail_token_cmd`, and
+`pubsub_token_cmd` are still preferred because they make `check-config` and
+service startup behavior more predictable.
 
 The service uses `Type=notify`. With systemd available, `mailwake` sends
 `READY=1` after config parsing, auth-helper executable checks, and watcher task
 spawning. It does not execute OAuth/password helpers as a separate startup
-preflight; helpers run when IMAP watchers connect and are bounded by
+preflight; helpers run when network-backed watchers connect and are bounded by
 `auth_helper_timeout_seconds`. With `--initial-connect-required`, readiness waits
 until every watcher completes initial setup before `READY=1` (for IMAP, that
-means one successful login/select/IDLE setup; for `fs_state`, it means the
+means one successful login/select/IDLE setup; for `gmail_api_watch`, it means
+watch registration and one successful Pub/Sub pull; for `fs_state`, it means the
 filesystem watcher was installed and any configured startup `state_cmd` attempt
 completed successfully; for `system_resume`, it means the systemd/logind D-Bus
 subscription is active). If an `fs_state` startup baseline fails or a
@@ -513,8 +583,9 @@ subscription is active). If an `fs_state` startup baseline fails or a
 `--initial-connect-required` is set, startup fails instead of reporting ready.
 
 Authentication failures are not treated like ordinary reconnectable network
-errors. If an IMAP watcher cannot obtain credentials from an auth helper, or the
-server rejects authentication, `mailwake` stops the daemon with exit status `78`.
+errors. If an IMAP or Gmail API watcher cannot obtain credentials from an auth
+helper, or the remote service rejects authentication/permission, `mailwake`
+stops the daemon with exit status `78`.
 The packaged systemd units use `RestartPreventExitStatus=78`, so reauth/config
 failures remain visible in `systemctl --user --failed` instead of disappearing
 inside a restart loop.

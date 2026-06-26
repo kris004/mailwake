@@ -1,5 +1,6 @@
-# Example mailwake config. Replace every path, email address, and command with
-# values for your own machine before using it.
+# Example mailwake config. Replace every path, email address, project id, topic,
+# subscription, token helper, and command with values for your own machine before
+# using it.
 
 # mailwake is generic: sources produce wake-up signals, commands run in lanes.
 default_debounce_seconds = 10
@@ -27,22 +28,40 @@ min_interval_seconds = 30
 output_mode = "failure_tail"
 output_tail_lines = 100
 
-[[accounts]]
-name = "example-imap"
-host = "imap.gmail.com"
-port = 993
-username = "user@example.com"
-auth = "xoauth2_cmd"
-xoauth2_cmd = "/home/alice/.local/bin/gmail-oauth-token"
-
+# Gmail wakeups can use the Gmail API metadata scope instead of the broad Gmail
+# IMAP/SMTP scope. Create the Pub/Sub topic/subscription outside mailwake.
 [[sources]]
 name = "remote-inbox"
-type = "imap_idle"
-account = "example-imap"
-mailbox = "INBOX"
+type = "gmail_api_watch"
 on_event = "remote-sync"
+gmail_token_cmd = "/home/alice/.local/bin/gmail-api-token"
+pubsub_token_cmd = "/home/alice/.local/bin/google-pubsub-token"
+topic_name = "projects/example-project/topics/mailwake-gmail"
+subscription = "projects/example-project/subscriptions/mailwake-gmail"
+label_ids = ["INBOX"]
+label_filter_behavior = "include"
 run_on_startup = true
 debounce_seconds = 10
+
+# Generic IMAP remains available for non-Gmail providers or for Gmail users who
+# intentionally choose IMAP XOAUTH2/app-password auth instead of Gmail API watch.
+#
+# [[accounts]]
+# name = "example-imap"
+# host = "imap.example.com"
+# port = 993
+# username = "user@example.com"
+# auth = "password_cmd"
+# password_cmd = "/usr/bin/pass show mail/example-password"
+#
+# [[sources]]
+# name = "remote-imap-inbox"
+# type = "imap_idle"
+# account = "example-imap"
+# mailbox = "INBOX"
+# on_event = "remote-sync"
+# run_on_startup = true
+# debounce_seconds = 10
 
 [[sources]]
 name = "system-resume"
