@@ -736,17 +736,19 @@ async fn run_daemon(
         warn!(%error, "failed to send systemd READY notification");
     }
     info!(%ready_status);
+    let status_changes = state.subscribe_status_changes();
+    tokio::spawn(systemd::run_status_task(
+        notifier.clone(),
+        Arc::clone(&state),
+        status_changes,
+        shutdown_rx.clone(),
+    ));
+
     let receiver_count = startup_tx.receiver_count();
     match startup_tx.send(true) {
         Ok(()) => info!(receiver_count, "broadcast run_on_startup signal"),
         Err(error) => warn!(receiver_count, %error, "failed to broadcast run_on_startup signal"),
     }
-
-    tokio::spawn(systemd::run_status_task(
-        notifier.clone(),
-        Arc::clone(&state),
-        shutdown_rx.clone(),
-    ));
 
     tokio::select! {
         () = wait_for_shutdown_signal() => {

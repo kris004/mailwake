@@ -590,6 +590,16 @@ subscription is active). If an `fs_state` startup baseline fails or a
 `system_resume` D-Bus subscription cannot be installed while
 `--initial-connect-required` is set, startup fails instead of reporting ready.
 
+Mailwake also publishes a generic operational summary through systemd's
+`STATUS=` notification field. The summary contains the stable fragment
+`running commands: N`, where `N` is the number of command lanes currently
+executing a configured command. Mailwake updates the status immediately when
+command activity changes, in addition to its periodic health update. This can
+be observed as the service's `StatusText` property over systemd's user D-Bus;
+the fragment contains only a count and does not expose command names or command
+lines. `StatusText` is informational and does not replace readiness, watchdog,
+or exit-status checks.
+
 Authentication failures are not treated like ordinary reconnectable network
 errors. If an IMAP or Gmail API watcher cannot obtain credentials from an auth
 helper, or the remote service rejects authentication/permission, `mailwake`

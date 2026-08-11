@@ -99,4 +99,7 @@ one successful metadata baseline.
 Systemd notification is opportunistic. Without `NOTIFY_SOCKET`, `mailwake` runs
 normally. Watchdog pings are sent only while the supervisor believes every source
 watcher task is alive and making progress, every command lane task is alive, and
-no command has exceeded its configured timeout.
+no command has exceeded its configured timeout. The human-readable systemd
+status includes a stable `running commands: N` fragment and is refreshed as
+command lanes start or finish, allowing local status consumers to reflect
+generic activity without learning command names or command lines.

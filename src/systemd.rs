@@ -90,12 +90,15 @@ impl Notifier {
 pub async fn run_status_task(
     notifier: Notifier,
     state: std::sync::Arc<RuntimeState>,
+    mut status_changes: watch::Receiver<u64>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let interval = notifier
         .watchdog_interval()
         .map(|watchdog| std::cmp::max(Duration::from_secs(1), watchdog / 2))
         .unwrap_or(Duration::from_secs(60));
+
+    send_runtime_status(&notifier, &state);
 
     loop {
         tokio::select! {
@@ -104,15 +107,19 @@ pub async fn run_status_task(
                     break;
                 }
             }
-            () = sleep(interval) => {
-                let status = state.status_message();
-                if let Err(error) = notifier.status(&status) {
-                    warn!(%error, "failed to send systemd status notification");
+            changed = status_changes.changed() => {
+                if changed.is_err() {
+                    break;
                 }
+                send_runtime_status(&notifier, &state);
+            }
+            () = sleep(interval) => {
+                send_runtime_status(&notifier, &state);
                 if notifier.watchdog_interval().is_some() {
                     if let Some(reason) = state.health_problem() {
                         warn!(%reason, "runtime health check failed; withholding systemd watchdog ping");
-                        let _ = notifier.status(&format!("mailwake unhealthy: {reason}"));
+                        let status = state.status_message();
+                        let _ = notifier.status(&format!("{status}; unhealthy: {reason}"));
                     } else {
                         if let Err(error) = notifier.watchdog() {
                             warn!(%error, "failed to send systemd watchdog notification");
@@ -121,6 +128,13 @@ pub async fn run_status_task(
                 }
             }
         }
+    }
+}
+
+fn send_runtime_status(notifier: &Notifier, state: &RuntimeState) {
+    let status = state.status_message();
+    if let Err(error) = notifier.status(&status) {
+        warn!(%error, "failed to send systemd status notification");
     }
 }
 
@@ -212,7 +226,10 @@ fn send_datagram_with_fd(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::state::RuntimeState;
 
     #[test]
     fn disabled_notifier_is_noop() {
@@ -233,5 +250,53 @@ mod tests {
         assert!(watchdog_pid_allows(Some("42"), 42));
         assert!(!watchdog_pid_allows(Some("43"), 42));
         assert!(!watchdog_pid_allows(Some("not-a-pid"), 42));
+    }
+
+    #[tokio::test]
+    async fn status_task_sends_command_activity_changes_immediately() {
+        let tempdir = tempfile::tempdir().expect("temporary notify socket directory");
+        let socket_path = tempdir.path().join("notify.sock");
+        let socket = tokio::net::UnixDatagram::bind(&socket_path).expect("bind notify socket");
+        let notifier = Notifier {
+            socket: Some(socket_path.into_os_string()),
+            watchdog_interval: None,
+        };
+        let state = Arc::new(RuntimeState::new(
+            0,
+            0,
+            1,
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        ));
+        state.register_command_runner("example");
+        let status_changes = state.subscribe_status_changes();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(run_status_task(
+            notifier,
+            Arc::clone(&state),
+            status_changes,
+            shutdown_rx,
+        ));
+        let mut buffer = [0_u8; 512];
+
+        let initial_size = tokio::time::timeout(Duration::from_secs(1), socket.recv(&mut buffer))
+            .await
+            .expect("initial status notification timeout")
+            .expect("receive initial status notification");
+        let initial = std::str::from_utf8(&buffer[..initial_size]).expect("UTF-8 status");
+        assert!(initial.contains("running commands: 0"));
+
+        state.mark_command_started("example");
+        let running_size = tokio::time::timeout(Duration::from_secs(1), socket.recv(&mut buffer))
+            .await
+            .expect("running status notification timeout")
+            .expect("receive running status notification");
+        let running = std::str::from_utf8(&buffer[..running_size]).expect("UTF-8 status");
+        assert!(running.contains("running commands: 1"));
+
+        shutdown_tx
+            .send(true)
+            .expect("request status task shutdown");
+        task.await.expect("status task joins");
     }
 }

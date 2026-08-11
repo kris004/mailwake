@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+use tokio::sync::watch;
 
 #[derive(Debug)]
 pub struct RuntimeState {
@@ -11,6 +12,7 @@ pub struct RuntimeState {
     total_command_lanes: usize,
     watcher_stale: Duration,
     command_timeout: Duration,
+    status_revision: watch::Sender<u64>,
     inner: Mutex<RuntimeInner>,
 }
 
@@ -91,12 +93,14 @@ impl RuntimeState {
         watcher_stale: Duration,
         command_timeout: Duration,
     ) -> Self {
+        let (status_revision, _) = watch::channel(0);
         Self {
             total_accounts,
             total_sources,
             total_command_lanes,
             watcher_stale,
             command_timeout,
+            status_revision,
             inner: Mutex::new(RuntimeInner {
                 watchers: HashMap::new(),
                 command_runners: HashMap::new(),
@@ -108,6 +112,10 @@ impl RuntimeState {
 
     pub fn total_sources(&self) -> usize {
         self.total_sources
+    }
+
+    pub fn subscribe_status_changes(&self) -> watch::Receiver<u64> {
+        self.status_revision.subscribe()
     }
 
     pub fn register_watcher(&self, id: impl Into<String>) {
@@ -177,10 +185,16 @@ impl RuntimeState {
                 last_progress: Instant::now(),
                 command_started: None,
             });
+        let running_changed =
+            (entry.phase == CommandRunnerPhase::Running) != (phase == CommandRunnerPhase::Running);
         entry.phase = phase;
         entry.last_progress = Instant::now();
         if phase != CommandRunnerPhase::Running {
             entry.command_started = None;
+        }
+        drop(inner);
+        if running_changed {
+            self.notify_status_changed();
         }
     }
 
@@ -197,6 +211,8 @@ impl RuntimeState {
         entry.phase = CommandRunnerPhase::Running;
         entry.last_progress = Instant::now();
         entry.command_started = Some(Instant::now());
+        drop(inner);
+        self.notify_status_changed();
     }
 
     pub fn mark_command_finished(&self, id: &str, outcome: &CommandOutcome) {
@@ -213,21 +229,38 @@ impl RuntimeState {
         entry.last_progress = Instant::now();
         entry.command_started = None;
         inner.last_command_success = Some(outcome.success);
+        drop(inner);
+        self.notify_status_changed();
     }
 
     pub fn mark_event(&self) {
         let mut inner = self.inner.lock().expect("runtime state mutex poisoned");
+        let changed = !inner.last_event_seen;
         inner.last_event_seen = true;
+        drop(inner);
+        if changed {
+            self.notify_status_changed();
+        }
     }
 
     pub fn mark_command_outcome(&self, outcome: &CommandOutcome) {
         let mut inner = self.inner.lock().expect("runtime state mutex poisoned");
+        let changed = inner.last_command_success != Some(outcome.success);
         inner.last_command_success = Some(outcome.success);
+        drop(inner);
+        if changed {
+            self.notify_status_changed();
+        }
     }
 
     pub fn mark_command_error(&self) {
         let mut inner = self.inner.lock().expect("runtime state mutex poisoned");
+        let changed = inner.last_command_success != Some(false);
         inner.last_command_success = Some(false);
+        drop(inner);
+        if changed {
+            self.notify_status_changed();
+        }
     }
 
     pub fn status_message(&self) -> String {
@@ -242,10 +275,20 @@ impl RuntimeState {
             Some(false) => "last command failed",
             None => "no command runs yet",
         };
+        let running_command_count = inner
+            .command_runners
+            .values()
+            .filter(|runner| runner.phase == CommandRunnerPhase::Running)
+            .count();
         format!(
-            "watching {} account(s), {} source(s); {event_text}; {command_text}",
-            self.total_accounts, self.total_sources
+            "watching {} account(s), {} source(s); running commands: {running_command_count}; {event_text}; {command_text}",
+            self.total_accounts, self.total_sources,
         )
+    }
+
+    fn notify_status_changed(&self) {
+        self.status_revision
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
     }
 
     pub fn is_healthy(&self) -> bool {
@@ -327,9 +370,37 @@ mod tests {
         let state = healthy_state();
         let status = state.status_message();
         assert!(status.contains("watching 1 account(s), 1 source(s)"));
+        assert!(status.contains("running commands: 0"));
         assert!(!status.contains("private-address"));
         assert!(!status.contains("gmail-oauth-token"));
         assert!(!status.contains("gmi sync"));
+    }
+
+    #[test]
+    fn status_reports_and_signals_running_command_count() {
+        let state = healthy_state();
+        let mut status_changes = state.subscribe_status_changes();
+
+        state.mark_command_started("gmail/INBOX");
+        assert!(status_changes.has_changed().expect("status channel open"));
+        assert!(state.status_message().contains("running commands: 1"));
+        status_changes.borrow_and_update();
+
+        state.mark_command_finished(
+            "gmail/INBOX",
+            &CommandOutcome {
+                success: true,
+                code: Some(0),
+                signal: None,
+                timed_out: false,
+                cancelled: false,
+                timeout: None,
+                output_limit_exceeded: false,
+                output_limit: None,
+            },
+        );
+        assert!(status_changes.has_changed().expect("status channel open"));
+        assert!(state.status_message().contains("running commands: 0"));
     }
 
     #[test]
