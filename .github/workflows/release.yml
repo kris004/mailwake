@@ -1,0 +1,443 @@
+name: Release binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to rebuild
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  build-linux-x86_64:
+    name: Build Linux x86-64 archive
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      asset_base: ${{ steps.release.outputs.asset_base }}
+      tag_object: ${{ steps.release.outputs.tag_object }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - name: Validate requested tag
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
+            echo "unsupported release tag: $RELEASE_TAG" >&2
+            exit 1
+          fi
+
+          version=${RELEASE_TAG#v}
+          if [[ "$version" == *-* ]]; then
+            prerelease=${version#*-}
+            IFS='.' read -r -a identifiers <<< "$prerelease"
+            for identifier in "${identifiers[@]}"; do
+              if [[ "$identifier" =~ ^[0-9]+$ && "$identifier" == 0* && "$identifier" != "0" ]]; then
+                echo "numeric prerelease identifiers cannot have leading zeroes: $identifier" >&2
+                exit 1
+              fi
+            done
+          fi
+
+      - name: Check out release tag
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          clean: true
+          fetch-depth: 0
+          persist-credentials: false
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+
+      - name: Validate tag and package version
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"
+          tag_object=$(git rev-parse "refs/tags/$RELEASE_TAG")
+          tag_commit=$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")
+          head_commit=$(git rev-parse HEAD)
+          if [[ "$tag_commit" != "$head_commit" ]]; then
+            echo "checkout $head_commit does not match $RELEASE_TAG ($tag_commit)" >&2
+            exit 1
+          fi
+
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            event_commit=$(git rev-parse "$GITHUB_SHA^{commit}")
+            if [[ "$event_commit" != "$head_commit" ]]; then
+              echo "push event $event_commit does not match checkout $head_commit" >&2
+              exit 1
+            fi
+          fi
+
+          version=${RELEASE_TAG#v}
+          package_version=$(python3 - <<'PY'
+          import tomllib
+
+          with open("Cargo.toml", "rb") as manifest:
+              print(tomllib.load(manifest)["package"]["version"])
+          PY
+          )
+          if [[ "$version" != "$package_version" ]]; then
+            echo "tag version $version does not match Cargo.toml $package_version" >&2
+            exit 1
+          fi
+
+          asset_base="mailwake-${version}-x86_64-unknown-linux-gnu-ubuntu-24.04"
+          {
+            echo "asset_base=$asset_base"
+            echo "tag_object=$tag_object"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust 1.95
+        run: rustup toolchain install 1.95.0 --profile minimal
+
+      - name: Test and build release binary
+        run: |
+          set -euo pipefail
+          export CARGO_INCREMENTAL=0
+          export SOURCE_DATE_EPOCH
+          SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
+
+          cargo +1.95.0 test --release --locked
+          cargo +1.95.0 build --release --locked
+          test "$(target/release/mailwake --version)" = \
+            "mailwake ${{ steps.release.outputs.version }}"
+          test "$(rustc +1.95.0 -vV | sed -n 's/^host: //p')" = \
+            "x86_64-unknown-linux-gnu"
+
+      - name: Verify third-party license notices
+        run: |
+          set -euo pipefail
+
+          about_version=0.9.1
+          about_archive="${RUNNER_TEMP}/cargo-about.tar.gz"
+          about_directory="${RUNNER_TEMP}/cargo-about-${about_version}-x86_64-unknown-linux-musl"
+          curl --proto '=https' --tlsv1.2 -fsSL \
+            "https://github.com/EmbarkStudios/cargo-about/releases/download/${about_version}/cargo-about-${about_version}-x86_64-unknown-linux-musl.tar.gz" \
+            -o "$about_archive"
+          echo "c0e7dc6f5d74b0beec5c0053d39ab24514c717d19acd91886907a22457ea9e98  $about_archive" \
+            | sha256sum --check -
+          tar -xzf "$about_archive" -C "$RUNNER_TEMP"
+
+          "$about_directory/cargo-about" generate \
+            --frozen \
+            --all-features \
+            --fail \
+            --output-file "${RUNNER_TEMP}/THIRD_PARTY_LICENSES.html" \
+            about.hbs
+          sed -i 's/\r$//' "${RUNNER_TEMP}/THIRD_PARTY_LICENSES.html"
+          if ! cmp -s THIRD_PARTY_LICENSES.html \
+            "${RUNNER_TEMP}/THIRD_PARTY_LICENSES.html"; then
+            diff -u THIRD_PARTY_LICENSES.html \
+              "${RUNNER_TEMP}/THIRD_PARTY_LICENSES.html"
+            exit 1
+          fi
+
+      - name: Package and validate archive
+        env:
+          ASSET_BASE: ${{ steps.release.outputs.asset_base }}
+          VERSION: ${{ steps.release.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          archive="${ASSET_BASE}.tar.gz"
+          checksum="${archive}.sha256"
+          package_root="dist/${ASSET_BASE}"
+          source_date_epoch=$(git show -s --format=%ct HEAD)
+
+          rm -rf dist
+          install -d "$package_root"
+          install -m 0755 target/release/mailwake "$package_root/mailwake"
+          install -m 0644 \
+            README.md \
+            SECURITY.md \
+            CONTRIBUTING.md \
+            LICENSE-APACHE \
+            LICENSE-MIT \
+            THIRD_PARTY_LICENSES.html \
+            "$package_root/"
+          cp -a contrib docs examples "$package_root/"
+
+          rust_copyright="$(rustc +1.95.0 --print sysroot)/share/doc/rust/COPYRIGHT-library.html"
+          test -f "$rust_copyright"
+          install -m 0644 "$rust_copyright" \
+            "$package_root/RUST-STANDARD-LIBRARY-COPYRIGHT.html"
+
+          if ldd target/release/mailwake | grep -F "not found"; then
+            echo "release binary has unresolved dynamic libraries" >&2
+            exit 1
+          fi
+
+          mapfile -t needed < <(
+            readelf -d target/release/mailwake \
+              | sed -n 's/.*Shared library: \[\([^]]*\)\].*/\1/p' \
+              | LC_ALL=C sort -u
+          )
+          test "${#needed[@]}" -gt 0
+          for library in libc.so.6 libcrypto.so.3 libssl.so.3; do
+            if ! printf '%s\n' "${needed[@]}" | grep -Fx "$library" >/dev/null; then
+              echo "expected dynamic library is missing: $library" >&2
+              exit 1
+            fi
+          done
+
+          {
+            echo "mailwake ${VERSION}"
+            echo "Tag: $RELEASE_TAG"
+            echo "Commit: $(git rev-parse HEAD)"
+            echo "Target: x86_64-unknown-linux-gnu"
+            echo "Build image: Ubuntu 24.04"
+            echo "Rust: $(rustc +1.95.0 --version)"
+            echo
+            echo "This binary is dynamically linked and requires a compatible"
+            echo "x86-64 glibc system with OpenSSL 3 libraries. It is not"
+            echo "compatible with musl-based distributions."
+            echo
+            echo "ELF dynamic library names:"
+            printf '  %s\n' "${needed[@]}"
+          } > "$package_root/BUILD-INFO.txt"
+
+          tar \
+            --sort=name \
+            --mtime="@${source_date_epoch}" \
+            --owner=0 \
+            --group=0 \
+            --numeric-owner \
+            -C dist \
+            -cf - \
+            "$ASSET_BASE" \
+            | gzip -n -9 > "dist/$archive"
+
+          (
+            cd dist
+            sha256sum "$archive" > "$checksum"
+            sha256sum --check "$checksum"
+          )
+
+          tar -tzf "dist/$archive" \
+            | awk -v root="$ASSET_BASE" '
+                $0 != root "/" && index($0, root "/") != 1 {
+                    print "unexpected archive path: " $0 > "/dev/stderr"
+                    bad = 1
+                }
+                END { exit bad }
+              '
+
+          verify_root="${RUNNER_TEMP}/mailwake-package-verify"
+          rm -rf "$verify_root"
+          install -d "$verify_root"
+          tar -xzf "dist/$archive" -C "$verify_root"
+
+          test "$(find "$verify_root" -mindepth 1 -maxdepth 1 | wc -l)" -eq 1
+          test "$(stat -c '%a' "$verify_root/$ASSET_BASE/mailwake")" = 755
+          test "$("$verify_root/$ASSET_BASE/mailwake" --version)" = \
+            "mailwake ${VERSION}"
+          test -x \
+            "$verify_root/$ASSET_BASE/contrib/oauth/gmail-oauth-token-oauth2l"
+          for required in \
+            BUILD-INFO.txt \
+            CONTRIBUTING.md \
+            LICENSE-APACHE \
+            LICENSE-MIT \
+            README.md \
+            RUST-STANDARD-LIBRARY-COPYRIGHT.html \
+            SECURITY.md \
+            THIRD_PARTY_LICENSES.html; do
+            test -f "$verify_root/$ASSET_BASE/$required"
+          done
+          cmp THIRD_PARTY_LICENSES.html \
+            "$verify_root/$ASSET_BASE/THIRD_PARTY_LICENSES.html"
+
+          du -h "dist/$archive"
+          tar -tzf "dist/$archive"
+
+      - name: Preserve release assets for publication
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-assets-${{ env.RELEASE_TAG }}
+          path: |
+            dist/${{ steps.release.outputs.asset_base }}.tar.gz
+            dist/${{ steps.release.outputs.asset_base }}.tar.gz.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  publish:
+    name: Attach assets to GitHub release
+    needs: build-linux-x86_64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Retrieve release assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-assets-${{ env.RELEASE_TAG }}
+          path: dist
+
+      - name: Validate retrieved assets
+        id: assets
+        env:
+          ASSET_BASE: ${{ needs.build-linux-x86_64.outputs.asset_base }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          archive="${ASSET_BASE}.tar.gz"
+          checksum="${archive}.sha256"
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 2
+          test -f "dist/$archive"
+          test -f "dist/$checksum"
+          (
+            cd dist
+            sha256sum --check "$checksum"
+          )
+
+          {
+            echo "archive=$archive"
+            echo "archive_digest=$(sha256sum "dist/$archive" | awk '{print $1}')"
+            echo "checksum=$checksum"
+            echo "checksum_digest=$(sha256sum "dist/$checksum" | awk '{print $1}')"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create draft and upload collision-safe assets
+        env:
+          ARCHIVE: ${{ steps.assets.outputs.archive }}
+          ARCHIVE_DIGEST: ${{ steps.assets.outputs.archive_digest }}
+          CHECKSUM: ${{ steps.assets.outputs.checksum }}
+          CHECKSUM_DIGEST: ${{ steps.assets.outputs.checksum_digest }}
+          EXPECTED_TAG_OBJECT: ${{ needs.build-linux-x86_64.outputs.tag_object }}
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.build-linux-x86_64.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          remote_tag_object=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" \
+            --jq '.object.sha')
+          if [[ "$remote_tag_object" != "$EXPECTED_TAG_OBJECT" ]]; then
+            echo "remote tag moved after build: expected $EXPECTED_TAG_OBJECT, got $remote_tag_object" >&2
+            exit 1
+          fi
+
+          if ! gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            if [[ "$GITHUB_EVENT_NAME" != "push" ]]; then
+              echo "manual rebuild requires an existing release for $RELEASE_TAG" >&2
+              exit 1
+            fi
+
+            notes_file="${RUNNER_TEMP}/mailwake-release-notes.md"
+            printf '%s\n' \
+              "Automated draft for mailwake ${VERSION}." \
+              "" \
+              "Review the release notes and uploaded artifacts before publishing." \
+              > "$notes_file"
+
+            release_args=(
+              "$RELEASE_TAG"
+              --repo "$GITHUB_REPOSITORY"
+              --verify-tag
+              --draft
+              --latest=false
+              --title "mailwake ${VERSION}"
+              --notes-file "$notes_file"
+            )
+            if [[ "$VERSION" == *-* ]]; then
+              release_args+=(--prerelease)
+            fi
+
+            if ! gh release create "${release_args[@]}"; then
+              gh release view "$RELEASE_TAG" \
+                --repo "$GITHUB_REPOSITORY" >/dev/null
+            fi
+          fi
+
+          release_json() {
+            gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}"
+          }
+
+          ensure_asset() {
+            local file=$1
+            local digest=$2
+            local name=${file##*/}
+            local json count state remote_digest
+
+            json=$(release_json)
+            count=$(jq --arg name "$name" \
+              '[.assets[] | select(.name == $name)] | length' <<< "$json")
+            if [[ "$count" -gt 1 ]]; then
+              echo "release has duplicate assets named $name" >&2
+              return 1
+            fi
+
+            if [[ "$count" -eq 1 ]]; then
+              state=$(jq -r --arg name "$name" \
+                '.assets[] | select(.name == $name) | .state' <<< "$json")
+              remote_digest=$(jq -r --arg name "$name" \
+                '.assets[] | select(.name == $name) | .digest' <<< "$json")
+              if [[ "$state" == "uploaded" && "$remote_digest" == "sha256:$digest" ]]; then
+                echo "$name already exists with the expected digest"
+                return 0
+              fi
+
+              echo "refusing to replace conflicting asset $name" >&2
+              echo "state=$state remote_digest=$remote_digest expected=sha256:$digest" >&2
+              return 1
+            fi
+
+            gh release upload "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              "$file"
+          }
+
+          verify_asset() {
+            local name=$1
+            local digest=$2
+            local _attempt json count state remote_digest
+
+            for _attempt in {1..10}; do
+              json=$(release_json)
+              count=$(jq --arg name "$name" \
+                '[.assets[] | select(.name == $name)] | length' <<< "$json")
+              if [[ "$count" -eq 1 ]]; then
+                state=$(jq -r --arg name "$name" \
+                  '.assets[] | select(.name == $name) | .state' <<< "$json")
+                remote_digest=$(jq -r --arg name "$name" \
+                  '.assets[] | select(.name == $name) | .digest' <<< "$json")
+                if [[ "$state" == "uploaded" && "$remote_digest" == "sha256:$digest" ]]; then
+                  return 0
+                fi
+              fi
+              sleep 2
+            done
+
+            echo "uploaded asset failed digest verification: $name" >&2
+            return 1
+          }
+
+          ensure_asset "dist/$ARCHIVE" "$ARCHIVE_DIGEST"
+          ensure_asset "dist/$CHECKSUM" "$CHECKSUM_DIGEST"
+          verify_asset "$ARCHIVE" "$ARCHIVE_DIGEST"
+          verify_asset "$CHECKSUM" "$CHECKSUM_DIGEST"

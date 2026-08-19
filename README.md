@@ -14,12 +14,13 @@ signals and user-supplied commands do the work.
 
 ## Status
 
-`mailwake` is pre-1.0 and currently installed from source. Configuration and
-runtime behavior may still change before a stable release. It targets Unix-like
-systems and requires a POSIX-style `sh`; current CI tests Linux, while other
-Unix-like systems are not yet verified. systemd notification and
-`system_resume` support are Linux-specific. The Rust modules are implementation
-details, not a stable library API.
+`mailwake` is pre-1.0. Source installation is supported, and a beta x86-64
+GNU/Linux binary is available from GitHub Releases. Configuration and runtime
+behavior may still change before a stable release. It targets Unix-like systems
+and requires a POSIX-style `sh`; current CI tests Linux, while other Unix-like
+systems are not yet verified. systemd notification and `system_resume` support
+are Linux-specific. The Rust modules are implementation details, not a stable
+library API.
 
 ## Sources
 
@@ -45,6 +46,32 @@ reconciliation is required.
 
 Configuration is loaded only at process start. Restart the daemon after changing
 the file.
+
+## Install a release binary
+
+A prebuilt x86-64 GNU/Linux binary is available from the
+[GitHub releases page](https://github.com/kris004/mailwake/releases). It is built
+and tested on Ubuntu 24.04 and dynamically links to glibc and OpenSSL 3
+(`libssl.so.3` and `libcrypto.so.3`). It is not compatible with musl-based
+distributions and may not run on older glibc-based distributions. Other
+platforms should install from source.
+
+For `v0.1.0-beta.2`, download both release assets into one directory, then run:
+
+```sh
+version=0.1.0-beta.2
+archive="mailwake-${version}-x86_64-unknown-linux-gnu-ubuntu-24.04"
+sha256sum --check "${archive}.tar.gz.sha256"
+tar -xzf "${archive}.tar.gz"
+install -d ~/.local/bin
+install -m 0755 "${archive}/mailwake" ~/.local/bin/mailwake
+~/.local/bin/mailwake --version
+```
+
+The SHA-256 file checks download integrity; it is not a cryptographic signature.
+The archive also contains project, dependency, and Rust standard-library license
+notices, plus the documentation, examples, OAuth helper, and basic and hardened
+systemd units. There are currently no package-manager releases.
 
 ## Install from source
 
@@ -78,8 +105,6 @@ build so a target-layout mismatch fails rather than installing a stale binary.
 Make variables are not persisted. If you install a systemd unit for a custom
 `PREFIX` or `BINDIR`, pass the same override to both `make install` and
 `make install-systemd` (or `make install-systemd-hardened`).
-
-There are currently no packaged binaries or package-manager releases.
 
 ## Quick start
 

@@ -37,6 +37,33 @@ jobs:
       - name: Run tests
         run: cargo +stable test --locked
 
+      - name: Verify third-party license notices
+        run: |
+          set -euo pipefail
+
+          about_version=0.9.1
+          about_archive="${RUNNER_TEMP}/cargo-about.tar.gz"
+          about_directory="${RUNNER_TEMP}/cargo-about-${about_version}-x86_64-unknown-linux-musl"
+          generated="${RUNNER_TEMP}/THIRD_PARTY_LICENSES.html"
+          curl --proto '=https' --tlsv1.2 -fsSL \
+            "https://github.com/EmbarkStudios/cargo-about/releases/download/${about_version}/cargo-about-${about_version}-x86_64-unknown-linux-musl.tar.gz" \
+            -o "$about_archive"
+          echo "c0e7dc6f5d74b0beec5c0053d39ab24514c717d19acd91886907a22457ea9e98  $about_archive" \
+            | sha256sum --check -
+          tar -xzf "$about_archive" -C "$RUNNER_TEMP"
+
+          "$about_directory/cargo-about" generate \
+            --frozen \
+            --all-features \
+            --fail \
+            --output-file "$generated" \
+            about.hbs
+          sed -i 's/\r$//' "$generated"
+          if ! cmp -s THIRD_PARTY_LICENSES.html "$generated"; then
+            diff -u THIRD_PARTY_LICENSES.html "$generated"
+            exit 1
+          fi
+
       - name: Verify public install and systemd targets
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/mailwake-target

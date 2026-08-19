@@ -131,6 +131,17 @@ Run `cargo fmt` to apply formatting if the formatting check fails. For
 documentation changes, review the rendered Markdown and verify any links you
 added or changed.
 
+If you changed `Cargo.toml` or `Cargo.lock`, regenerate and review the bundled
+dependency notices with cargo-about 0.9.1:
+
+```sh
+cargo install --locked --version 0.9.1 --features cli cargo-about
+cargo fetch --locked --target x86_64-unknown-linux-gnu
+cargo about generate --frozen --all-features --fail \
+  --output-file THIRD_PARTY_LICENSES.html about.hbs
+sed -i 's/\r$//' THIRD_PARTY_LICENSES.html
+```
+
 If you changed the OAuth shell helper, also run:
 
 ```sh
@@ -154,7 +165,8 @@ rm -rf "$tmpdir"
 ```
 
 GitHub Actions repeats these checks and also verifies the minimum Rust version,
-package contents, installation targets, and generated systemd units.
+dependency notices, package contents, installation targets, and generated
+systemd units.
 
 ## Opening a pull request
 
