@@ -138,17 +138,23 @@ sh -n contrib/oauth/gmail-oauth-token-oauth2l
 shellcheck contrib/oauth/gmail-oauth-token-oauth2l
 ```
 
-If you changed a checked-in systemd unit, run:
+If you changed a systemd unit or its Makefile installation logic, verify the
+generated basic and hardened units against a temporary installation:
 
 ```sh
-systemd-analyze --user verify contrib/systemd/*.service
+tmpdir=$(mktemp -d)
+CARGO_TARGET_DIR="$tmpdir/target" make PREFIX="$tmpdir/prefix" install
+"$tmpdir/prefix/bin/mailwake" --version
+make PREFIX="$tmpdir/prefix" SYSTEMD_USER_DIR="$tmpdir/basic" install-systemd
+systemd-analyze --user verify "$tmpdir/basic/mailwake.service"
+make PREFIX="$tmpdir/prefix" SYSTEMD_USER_DIR="$tmpdir/hardened" \
+  install-systemd-hardened
+systemd-analyze --user verify "$tmpdir/hardened/mailwake.service"
+rm -rf "$tmpdir"
 ```
 
 GitHub Actions repeats these checks and also verifies the minimum Rust version,
-package contents, installation targets, and generated systemd units. If you
-change Makefile installation logic, the temporary-prefix smoke test in
-[the CI workflow](.github/workflows/ci.yml) can also be run locally on a systemd
-host.
+package contents, installation targets, and generated systemd units.
 
 ## Opening a pull request
 

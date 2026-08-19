@@ -37,7 +37,7 @@ jobs:
       - name: Run tests
         run: cargo +stable test --locked
 
-      - name: Verify public install targets
+      - name: Verify public install and systemd targets
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/mailwake-target
         run: |
@@ -55,9 +55,6 @@ jobs:
 
       - name: Lint shell helper
         run: shellcheck contrib/oauth/gmail-oauth-token-oauth2l
-
-      - name: Verify systemd user units
-        run: systemd-analyze --user verify contrib/systemd/*.service
 
       - name: Verify package contents
         run: cargo +stable package --locked
