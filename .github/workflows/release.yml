@@ -136,6 +136,7 @@ jobs:
           echo "c0e7dc6f5d74b0beec5c0053d39ab24514c717d19acd91886907a22457ea9e98  $about_archive" \
             | sha256sum --check -
           tar -xzf "$about_archive" -C "$RUNNER_TEMP"
+          cargo +1.95.0 fetch --locked
 
           "$about_directory/cargo-about" generate \
             --frozen \

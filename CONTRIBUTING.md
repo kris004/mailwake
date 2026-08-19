@@ -136,7 +136,7 @@ dependency notices with cargo-about 0.9.1:
 
 ```sh
 cargo install --locked --version 0.9.1 --features cli cargo-about
-cargo fetch --locked --target x86_64-unknown-linux-gnu
+cargo fetch --locked
 cargo about generate --frozen --all-features --fail \
   --output-file THIRD_PARTY_LICENSES.html about.hbs
 sed -i 's/\r$//' THIRD_PARTY_LICENSES.html
