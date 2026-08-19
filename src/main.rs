@@ -94,7 +94,6 @@ async fn main() -> ExitCode {
                 .downcast_ref::<CodedExitError>()
                 .map(|error| ExitCode::from(error.code))
                 .unwrap_or(ExitCode::FAILURE);
-            error!(%error, "mailwake failed");
             eprintln!("error: {error}");
             exit_code
         }
@@ -139,8 +138,7 @@ async fn run(cli: Cli) -> Result<()> {
 }
 
 fn check_config(path: &Path) -> Result<()> {
-    let config =
-        Config::load(path).with_context(|| format!("failed to load {}", path.display()))?;
+    let config = Config::load(path)?;
     config.warn_for_insecure_options();
     auth::validate_auth_helpers(&config)?;
     println!(
@@ -159,8 +157,7 @@ async fn test_command(
     account_name: Option<&str>,
     mailbox_name: Option<&str>,
 ) -> Result<()> {
-    let config =
-        Config::load(path).with_context(|| format!("failed to load {}", path.display()))?;
+    let config = Config::load(path)?;
     config.warn_for_insecure_options();
     let (command_name, command, timeout, output_policy, description) =
         configured_test_command(&config, command_name, account_name, mailbox_name)?;
@@ -330,8 +327,7 @@ async fn run_daemon(
     systemd_enabled: bool,
     initial_connect_required: bool,
 ) -> Result<()> {
-    let config =
-        Config::load(path).with_context(|| format!("failed to load {}", path.display()))?;
+    let config = Config::load(path)?;
     auth::validate_auth_helpers(&config)?;
     config.warn_for_insecure_options();
 
@@ -1150,6 +1146,26 @@ fn expand_tilde(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn check_config_reports_validation_reason_without_echoing_commands() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[commands]]
+name = "example"
+cmd = "printf private-command-output"
+"#,
+        )
+        .expect("test config should be written");
+
+        let error = check_config(&path).expect_err("config without a source should fail");
+        let message = error.to_string();
+        assert!(message.contains("at least one source is required"));
+        assert!(!message.contains("private-command-output"));
+    }
 
     #[test]
     fn test_command_accepts_named_command() {

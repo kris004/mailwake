@@ -1,0 +1,75 @@
+# Gmail/IMAP integration example. Replace every path, email address, and
+# command with values for your own machine before using it.
+
+# mailwake is generic: sources produce wake-up signals, commands run in lanes.
+default_debounce_seconds = 10
+default_max_debounce_seconds = 60
+command_timeout_seconds = 300
+command_output_max_bytes = 1048576
+command_output_tail_lines = 100
+min_command_interval_seconds = 60
+
+[[commands]]
+name = "remote-sync"
+lane = "example-sync"
+cmd = "cd /home/alice/.mail/example && flock -n .sync.lock gmi sync && notmuch new"
+timeout_seconds = 300
+min_interval_seconds = 60
+output_mode = "silent"
+
+[[commands]]
+name = "local-push"
+lane = "example-sync"
+cmd = "cd /home/alice/.mail/example && flock -n .sync.lock gmi push"
+timeout_seconds = 300
+min_interval_seconds = 30
+output_mode = "silent"
+
+[[accounts]]
+name = "example-imap"
+host = "imap.gmail.com"
+port = 993
+username = "user@example.com"
+auth = "xoauth2_cmd"
+xoauth2_cmd = "/home/alice/.local/bin/gmail-oauth-token"
+
+[[sources]]
+name = "remote-inbox"
+type = "imap_idle"
+account = "example-imap"
+mailbox = "INBOX"
+on_event = "remote-sync"
+run_on_startup = true
+debounce_seconds = 10
+
+# Alternative for Gmail users who prefer the narrower Gmail API metadata scope
+# over true IMAP IDLE. This polls locally and avoids Pub/Sub, a webhook, and a
+# public endpoint, but it still requires an OAuth client and token helper.
+#
+# [[sources]]
+# name = "gmail-api-inbox"
+# type = "gmail_api_poll"
+# on_event = "remote-sync"
+# gmail_token_cmd = "/home/alice/.local/bin/gmail-api-token"
+# label_ids = ["INBOX"]
+# run_on_startup = true
+# debounce_seconds = 10
+# poll_interval_seconds = 60
+
+# Optional on Linux systems with systemd/logind:
+# [[sources]]
+# name = "system-resume"
+# type = "system_resume"
+# on_resume = "remote-sync"
+# settle_seconds = 20
+
+[[sources]]
+name = "local-state"
+type = "fs_state"
+watch_paths = ["/home/alice/.mail/example/.notmuch"]
+recursive = false
+state_cmd = "cd /home/alice/.mail/example && notmuch count --lastmod"
+on_change = "local-push"
+run_on_startup = false
+debounce_seconds = 5
+max_debounce_seconds = 60

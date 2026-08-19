@@ -4,4 +4,8 @@ _review/
 config.toml
 *.local.toml
 examples/*.local.toml
+*.local.json
+google-oauth-client.json
+*oauth2l-cache*.json
+.oauth2l
 .env

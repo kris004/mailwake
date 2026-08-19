@@ -118,8 +118,7 @@ pub async fn run_status_task(
                 if notifier.watchdog_interval().is_some() {
                     if let Some(reason) = state.health_problem() {
                         warn!(%reason, "runtime health check failed; withholding systemd watchdog ping");
-                        let status = state.status_message();
-                        let _ = notifier.status(&format!("{status}; unhealthy: {reason}"));
+                        let _ = notifier.status(&unhealthy_status_message(&state));
                     } else {
                         if let Err(error) = notifier.watchdog() {
                             warn!(%error, "failed to send systemd watchdog notification");
@@ -136,6 +135,10 @@ fn send_runtime_status(notifier: &Notifier, state: &RuntimeState) {
     if let Err(error) = notifier.status(&status) {
         warn!(%error, "failed to send systemd status notification");
     }
+}
+
+fn unhealthy_status_message(state: &RuntimeState) -> String {
+    format!("{}; unhealthy", state.status_message())
 }
 
 fn sanitize_field(value: &str) -> String {
@@ -229,7 +232,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::state::RuntimeState;
+    use crate::state::{RuntimeState, WatcherPhase};
 
     #[test]
     fn disabled_notifier_is_noop() {
@@ -250,6 +253,17 @@ mod tests {
         assert!(watchdog_pid_allows(Some("42"), 42));
         assert!(!watchdog_pid_allows(Some("43"), 42));
         assert!(!watchdog_pid_allows(Some("not-a-pid"), 42));
+    }
+
+    #[test]
+    fn unhealthy_status_omits_health_reason_identifiers() {
+        let state = RuntimeState::new(1, 0, 0, Duration::from_secs(60), Duration::from_secs(60));
+        state.register_watcher("private-source-name");
+        state.mark_watcher("private-source-name", WatcherPhase::Crashed);
+
+        let status = unhealthy_status_message(&state);
+        assert!(status.ends_with("; unhealthy"));
+        assert!(!status.contains("private-source-name"));
     }
 
     #[tokio::test]

@@ -1,7 +1,5 @@
 [Unit]
 Description=mailwake event-driven command trigger
-Wants=network-online.target
-After=network-online.target
 StartLimitIntervalSec=15min
 StartLimitBurst=3
 
@@ -21,7 +19,9 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=%h/.mail %h/.cache %h/.local/state %h/.config/mailwake
+# Add the narrowest writable paths required by configured commands.
+# A leading "-" makes these cache/state paths optional.
+ReadWritePaths=-%h/.cache -%h/.local/state
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 LockPersonality=true
 MemoryDenyWriteExecute=true

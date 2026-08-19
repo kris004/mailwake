@@ -788,9 +788,6 @@ impl SourceConfig {
                     validate_nonempty("source label_ids", label_id)?;
                     validate_no_crlf("source label_ids", label_id)?;
                 }
-                if let Some(debounce) = source.debounce_seconds {
-                    validate_nonzero_seconds("source debounce_seconds", debounce)?;
-                }
                 if let Some(poll_interval) = source.poll_interval_seconds {
                     validate_nonzero_seconds("source poll_interval_seconds", poll_interval)?;
                     if poll_interval < 10 {
@@ -1214,6 +1211,17 @@ xoauth2_cmd = "gmail-oauth-token"
 name = "INBOX"
 on_notify = "echo sync"
 debounce_seconds = 0
+
+[[commands]]
+name = "remote-sync"
+cmd = "echo remote"
+
+[[sources]]
+name = "gmail-api"
+type = "gmail_api_poll"
+on_event = "remote-sync"
+gmail_token_cmd = "gmail-api-token"
+debounce_seconds = 0
 "#,
         )
         .expect("zero debounce is allowed when explicitly configured");
@@ -1222,6 +1230,10 @@ debounce_seconds = 0
             config.accounts[0].mailboxes[0].debounce(&config).as_secs(),
             0
         );
+        let SourceConfig::GmailApiPoll(source) = &config.sources[0] else {
+            panic!("source should be gmail_api_poll");
+        };
+        assert_eq!(source.debounce(&config).as_secs(), 0);
         assert_eq!(config.min_command_interval().as_secs(), 0);
     }
 

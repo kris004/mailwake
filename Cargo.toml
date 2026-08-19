@@ -3,8 +3,13 @@ name = "mailwake"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
-description = "Tiny event-driven daemon that runs commands when configured sources change"
+description = "Event-driven Unix daemon that runs commands when configured sources change"
 license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/kris004/mailwake"
+publish = false
+keywords = ["automation", "daemon", "file-watcher", "imap", "systemd"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 anyhow = "1"

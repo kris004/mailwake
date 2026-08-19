@@ -1,7 +1,8 @@
-# Example mailwake config. Replace every path, email address, and command with
-# values for your own machine before using it.
+# Generic mailwake configuration example.
+#
+# Replace every path and command with values for your own machine before
+# running the daemon. The Gmail/IMAP recipe lives in gmail.example.toml.
 
-# mailwake is generic: sources produce wake-up signals, commands run in lanes.
 default_debounce_seconds = 10
 default_max_debounce_seconds = 60
 command_timeout_seconds = 300
@@ -10,66 +11,31 @@ command_output_tail_lines = 100
 min_command_interval_seconds = 60
 
 [[commands]]
-name = "remote-sync"
-lane = "example-sync"
-cmd = "cd /home/alice/.mail/example && flock -n .sync.lock gmi sync && notmuch new"
+name = "refresh-state"
+lane = "example-maintenance"
+cmd = "/home/alice/.local/bin/refresh-example-state"
 timeout_seconds = 300
 min_interval_seconds = 60
 output_mode = "failure_tail"
 output_tail_lines = 100
 
-[[commands]]
-name = "local-push"
-lane = "example-sync"
-cmd = "cd /home/alice/.mail/example && flock -n .sync.lock gmi push"
-timeout_seconds = 300
-min_interval_seconds = 30
-output_mode = "failure_tail"
-output_tail_lines = 100
-
-[[accounts]]
-name = "example-imap"
-host = "imap.gmail.com"
-port = 993
-username = "user@example.com"
-auth = "xoauth2_cmd"
-xoauth2_cmd = "/home/alice/.local/bin/gmail-oauth-token"
-
-[[sources]]
-name = "remote-inbox"
-type = "imap_idle"
-account = "example-imap"
-mailbox = "INBOX"
-on_event = "remote-sync"
-run_on_startup = true
-debounce_seconds = 10
-
-# Alternative for Gmail users who prefer the narrower Gmail API metadata scope
-# over true IMAP IDLE. This polls locally and needs no Google Cloud setup.
-#
-# [[sources]]
-# name = "gmail-api-inbox"
-# type = "gmail_api_poll"
-# on_event = "remote-sync"
-# gmail_token_cmd = "/home/alice/.local/bin/gmail-api-token"
-# label_ids = ["INBOX"]
-# run_on_startup = true
-# debounce_seconds = 10
-# poll_interval_seconds = 60
-
-[[sources]]
-name = "system-resume"
-type = "system_resume"
-on_resume = "remote-sync"
-settle_seconds = 20
-
+# Filesystem events are wake-up signals. state_cmd produces an opaque value;
+# mailwake runs refresh-state only after that value changes.
 [[sources]]
 name = "local-state"
 type = "fs_state"
-watch_paths = ["/home/alice/.mail/example/.notmuch"]
+watch_paths = ["/home/alice/.local/state/example"]
 recursive = false
-state_cmd = "cd /home/alice/.mail/example && notmuch count --lastmod"
-on_change = "local-push"
+state_cmd = "cat /home/alice/.local/state/example/version"
+on_change = "refresh-state"
 run_on_startup = false
 debounce_seconds = 5
 max_debounce_seconds = 60
+
+# Optional on Linux systems using systemd/logind: run the same reconciliation
+# command after the machine resumes from sleep.
+# [[sources]]
+# name = "system-resume"
+# type = "system_resume"
+# on_resume = "refresh-state"
+# settle_seconds = 15

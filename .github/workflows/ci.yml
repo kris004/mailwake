@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  quality:
+    name: Format, lint, and test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          clean: true
+          persist-credentials: false
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+
+      - name: Check formatting
+        run: cargo +stable fmt --check
+
+      - name: Run Clippy
+        run: cargo +stable clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Run tests
+        run: cargo +stable test --locked
+
+      - name: Check shell helper syntax
+        run: sh -n contrib/oauth/gmail-oauth-token-oauth2l
+
+      - name: Lint shell helper
+        run: shellcheck contrib/oauth/gmail-oauth-token-oauth2l
+
+      - name: Verify systemd user units
+        run: systemd-analyze --user verify contrib/systemd/*.service
+
+      - name: Verify package contents
+        run: cargo +stable package --locked
+
+  msrv:
+    name: Rust 1.95 compatibility
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          clean: true
+          persist-credentials: false
+
+      - name: Install Rust 1.95
+        run: rustup toolchain install 1.95.0 --profile minimal
+
+      - name: Check all targets
+        run: cargo +1.95.0 check --all-targets --all-features --locked

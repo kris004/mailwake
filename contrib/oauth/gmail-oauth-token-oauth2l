@@ -7,8 +7,8 @@
 #   token cache: ~/.local/state/mailwake/oauth2l-cache.json
 #
 # First-time interactive setup:
-#   gmail-oauth-token-oauth2l --setup
-# Reauthorize without printing tokens, for systemd OnFailure hooks:
+#   gmail-oauth-token-oauth2l --setup >/dev/null
+# Reauthorize without printing tokens:
 #   gmail-oauth-token-oauth2l --reauth
 #
 # mailwake config:
@@ -39,7 +39,8 @@ Environment overrides:
   MAILWAKE_REAUTH_REQUIRED_EXIT exit code for expired/revoked refresh token
 
 Run --setup manually once before using this helper from mailwake/systemd.
-Use --reauth from systemd hooks; it resets the cache and never prints tokens.
+Use --reauth only where an interactive OAuth flow can be presented; it resets
+the cache and never prints tokens.
 USAGE
 }
 

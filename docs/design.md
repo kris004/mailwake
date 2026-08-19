@@ -12,6 +12,10 @@ commands, and OAuth helpers stay outside the daemon. Provider-specific sources
 may use provider cursors or filters, but they still emit only generic wake-up
 events.
 
+Those events are deliberately non-durable. Sources do not append work to a
+persistent queue, so configured commands must reconcile current state rather
+than rely on one invocation per upstream event.
+
 ## Shape
 
 - One Tokio task watches each configured source.
@@ -25,12 +29,13 @@ events.
   comparison submit command requests to command lanes.
 - Commands in the same lane are serialized and repeated requests for the same
   command are coalesced.
-- Authentication secrets are obtained on connection/reconnection with a bounded
-  helper timeout/output cap and wrapped in a redacted secret type. Helpers run
-  only after TCP/TLS connect and server greeting succeed.
-- Notification commands have a bounded runtime. Timeout is a command outcome, not
+- Authentication secrets are obtained with a bounded helper timeout/output cap
+  and wrapped in a redacted secret type. IMAP helpers run only after TCP/TLS
+  connect and the server greeting succeed; Gmail API helpers run when a
+  baseline or poll request needs a token.
+- Configured commands have a bounded runtime. Timeout is a command outcome, not
   a daemon-fatal error.
-- Auth helpers and notification commands run in separate Unix process groups.
+- Auth helpers and configured commands run in separate Unix process groups.
   Timeout and shutdown paths terminate the whole process group and reap the
   shell.
 - Per-command cooldowns coalesce events that arrive immediately after a command
@@ -74,17 +79,19 @@ and avoids logging secret values in validation errors.
 
 ## Gmail API poll safety
 
-The Gmail API poll source is a lower-scope fallback for Gmail users who do not
-want the broad Gmail IMAP scope. It uses `users.getProfile` for the current
-history id and, when label filters are configured, `users.history.list` to check
-whether changed history intersects those labels. It does not call Gmail APIs
-that read message bodies, send mail, modify mail, or delete mail.
+The Gmail API poll source is a lower-scope polling alternative for Gmail users
+who do not want the broad Gmail IMAP scope. It uses `users.getProfile` for the
+current history id and, when label filters are configured,
+`users.history.list` to check whether changed history intersects those labels.
+It does not call Gmail APIs that read message bodies, send mail, modify mail, or
+delete mail.
 
-The source is deliberately local-only: it only calls Gmail HTTPS APIs from the
-daemon and does not manage OAuth client registration.
+The source is deliberately local-only: it calls Gmail HTTPS APIs from the
+daemon and requires no Pub/Sub topic, webhook, or public endpoint. It does not
+manage the required OAuth client registration or token acquisition.
 If Gmail reports that the stored history baseline is too old, the source emits
 one wake-up event and rebaselines so the external sync command can repair local
-state.
+state. The baseline is memory-only and is recreated at process startup.
 
 ## Readiness and watchdog
 
@@ -92,9 +99,10 @@ Config parsing and auth-helper path checks happen before `READY=1`. The daemon
 intentionally avoids a separate auth-helper execution preflight so startup does
 not double-run OAuth/password helpers. Helper execution happens in watcher tasks
 and is bounded by `auth_helper_timeout_seconds`. With `--initial-connect-required`,
-readiness also waits for every watcher to complete initial setup; for IMAP that
-means one successful login/examine/IDLE setup, and for Gmail API poll that means
-one successful metadata baseline.
+readiness also waits for every watcher to complete initial setup: IMAP must
+login, examine, and enter IDLE; Gmail API polling must establish one metadata
+baseline; `fs_state` must install its watcher and complete any startup baseline;
+and `system_resume` must subscribe to systemd/logind D-Bus.
 
 Systemd notification is opportunistic. Without `NOTIFY_SOCKET`, `mailwake` runs
 normally. Watchdog pings are sent only while the supervisor believes every source
