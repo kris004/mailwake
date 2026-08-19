@@ -70,6 +70,11 @@ the separate `uninstall-systemd` target removes an installed example unit.
 The commands below assume the selected binary directory is on `PATH`; otherwise,
 replace `mailwake` with its absolute path.
 
+`make install` is a native-build target. It honors `CARGO_TARGET_DIR`, but not a
+Cargo cross-compilation target; use a packaging workflow instead when building
+for another target. The release recipe removes its expected output before each
+build so a target-layout mismatch fails rather than installing a stale binary.
+
 Make variables are not persisted. If you install a systemd unit for a custom
 `PREFIX` or `BINDIR`, pass the same override to both `make install` and
 `make install-systemd` (or `make install-systemd-hardened`).
@@ -132,10 +137,12 @@ controls.
   Timeout, capture-limit failure, or shutdown terminates the command's Unix
   process group. `journal` mode streams output without a capture limit.
 - A command failure is a command outcome; it does not by itself stop the daemon.
-- Authentication failures and Gmail API permission rejections are fail-stop
+- IMAP authentication failures, an OAuth helper's explicit reauthorization
+  signal, HTTP 401, and known Gmail API permission rejections are fail-stop
   errors. The daemon exits with status `78` so a supervisor can leave the
-  problem visible instead of retrying forever. Other protocol failures,
-  including IMAP mailbox command rejection, reconnect with backoff.
+  problem visible instead of retrying forever. Transient Gmail helper, quota,
+  rate-limit, network, and other protocol failures retry with backoff; IMAP
+  mailbox command rejection reconnects.
 - Network and protocol failures reconnect with backoff.
 - systemd readiness and watchdog support are opportunistic. The daemon also runs
   normally without `NOTIFY_SOCKET`.

@@ -7,7 +7,9 @@ use std::future::Future;
 use std::time::Duration;
 use std::{fmt, sync::Arc};
 use thiserror::Error;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{sleep, timeout};
@@ -16,6 +18,7 @@ use tracing::{debug, info, warn};
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
+const MAX_RESPONSE_LINE_BYTES: usize = 64 * 1024;
 pub const INITIAL_AUTH_FAILURE_PREFIX: &str = "IMAP watcher authentication failed";
 
 #[derive(Clone, Copy, Debug)]
@@ -427,7 +430,21 @@ where
             tokio::select! {
                 changed = context.shutdown.changed() => {
                     if changed.is_ok() && *context.shutdown.borrow() {
-                        let _ = finish_idle(reader, writer, &tag, context.settings.operation_timeout).await;
+                        let _ = finish_idle(
+                            reader,
+                            writer,
+                            &tag,
+                            context.settings.operation_timeout,
+                            || {
+                                queue_mailbox_event(
+                                    context.events,
+                                    context.state,
+                                    &context.account.name,
+                                    &context.mailbox.name,
+                                );
+                            },
+                        )
+                        .await;
                         return Ok(RunEnd::Shutdown);
                     }
                 }
@@ -437,7 +454,21 @@ where
                         mailbox = %context.mailbox.name,
                         "IMAP IDLE refresh"
                     );
-                    finish_idle(reader, writer, &tag, context.settings.operation_timeout).await?;
+                    finish_idle(
+                        reader,
+                        writer,
+                        &tag,
+                        context.settings.operation_timeout,
+                        || {
+                            queue_mailbox_event(
+                                context.events,
+                                context.state,
+                                &context.account.name,
+                                &context.mailbox.name,
+                            );
+                        },
+                    )
+                    .await?;
                     context
                         .state
                         .mark_watcher(context.watcher_id, WatcherPhase::Idling);
@@ -449,41 +480,30 @@ where
                         return Err(ImapError::ServerClosed);
                     }
                     let line = trim_line(&line);
-                    if line.to_ascii_uppercase().starts_with("* BYE") {
-                        return Err(ImapError::ServerClosed);
-                    }
-                    if is_tagged_ok(line, &tag) {
-                        debug!(
-                            account = %context.account.name,
-                            mailbox = %context.mailbox.name,
-                            "server ended IDLE; re-entering"
-                        );
-                        break;
-                    }
-                    if is_tagged_completion(line, &tag) {
-                        return Err(ImapError::CommandRejected { command: "IDLE" });
-                    }
-                    context
-                        .state
-                        .mark_watcher(context.watcher_id, WatcherPhase::Idling);
-                    if is_mailbox_change(line) {
-                        context.state.mark_event();
-                        match context.events.try_send(()) {
-                            Ok(()) => {}
-                            Err(mpsc::error::TrySendError::Full(())) => {
-                                debug!(
-                                    account = %context.account.name,
-                                    mailbox = %context.mailbox.name,
-                                    "mailbox event queue is full; coalescing event"
-                                );
-                            }
-                            Err(mpsc::error::TrySendError::Closed(())) => {
-                                warn!(
-                                    account = %context.account.name,
-                                    mailbox = %context.mailbox.name,
-                                    "mailbox event queue is closed"
-                                );
-                            }
+                    match classify_idle_response(line, &tag)? {
+                        IdleResponse::Completed => {
+                            debug!(
+                                account = %context.account.name,
+                                mailbox = %context.mailbox.name,
+                                "server ended IDLE; re-entering"
+                            );
+                            break;
+                        }
+                        IdleResponse::MailboxChange => {
+                            context
+                                .state
+                                .mark_watcher(context.watcher_id, WatcherPhase::Idling);
+                            queue_mailbox_event(
+                                context.events,
+                                context.state,
+                                &context.account.name,
+                                &context.mailbox.name,
+                            );
+                        }
+                        IdleResponse::Other => {
+                            context
+                                .state
+                                .mark_watcher(context.watcher_id, WatcherPhase::Idling);
                         }
                     }
                 }
@@ -522,15 +542,17 @@ where
     }
 }
 
-async fn finish_idle<R, W>(
+async fn finish_idle<R, W, F>(
     reader: &mut R,
     writer: &mut W,
     tag: &str,
     operation_timeout: Duration,
+    mut on_mailbox_change: F,
 ) -> Result<(), ImapError>
 where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
+    F: FnMut(),
 {
     with_imap_timeout(
         operation_timeout,
@@ -541,9 +563,82 @@ where
     with_imap_timeout(
         operation_timeout,
         "IDLE tagged response",
-        wait_tagged(reader, tag, "IDLE"),
+        wait_idle_completion(reader, tag, &mut on_mailbox_change),
     )
     .await
+}
+
+async fn wait_idle_completion<R, F>(
+    reader: &mut R,
+    tag: &str,
+    on_mailbox_change: &mut F,
+) -> Result<(), ImapError>
+where
+    R: AsyncBufRead + Unpin,
+    F: FnMut(),
+{
+    let mut event_queued = false;
+    loop {
+        let line = read_line(reader).await?;
+        match classify_idle_response(&line, tag)? {
+            IdleResponse::Completed => return Ok(()),
+            IdleResponse::MailboxChange if !event_queued => {
+                on_mailbox_change();
+                event_queued = true;
+            }
+            IdleResponse::MailboxChange => {}
+            IdleResponse::Other => {}
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IdleResponse {
+    Completed,
+    MailboxChange,
+    Other,
+}
+
+fn classify_idle_response(line: &str, tag: &str) -> Result<IdleResponse, ImapError> {
+    if line.to_ascii_uppercase().starts_with("* BYE") {
+        return Err(ImapError::ServerClosed);
+    }
+    if is_tagged_ok(line, tag) {
+        return Ok(IdleResponse::Completed);
+    }
+    if is_tagged_completion(line, tag) {
+        return Err(ImapError::CommandRejected { command: "IDLE" });
+    }
+    if is_mailbox_change(line) {
+        return Ok(IdleResponse::MailboxChange);
+    }
+    Ok(IdleResponse::Other)
+}
+
+fn queue_mailbox_event(
+    events: &mpsc::Sender<()>,
+    state: &RuntimeState,
+    account_name: &str,
+    mailbox_name: &str,
+) {
+    state.mark_event();
+    match events.try_send(()) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(())) => {
+            debug!(
+                account = %account_name,
+                mailbox = %mailbox_name,
+                "mailbox event queue is full; coalescing event"
+            );
+        }
+        Err(mpsc::error::TrySendError::Closed(())) => {
+            warn!(
+                account = %account_name,
+                mailbox = %mailbox_name,
+                "mailbox event queue is closed"
+            );
+        }
+    }
 }
 
 async fn read_line<R>(reader: &mut R) -> Result<String, ImapError>
@@ -551,9 +646,15 @@ where
     R: AsyncBufRead + Unpin,
 {
     let mut line = String::new();
-    let bytes = reader.read_line(&mut line).await?;
+    let mut limited = reader.take((MAX_RESPONSE_LINE_BYTES + 1) as u64);
+    let bytes = limited.read_line(&mut line).await?;
     if bytes == 0 {
         return Err(ImapError::ServerClosed);
+    }
+    if bytes > MAX_RESPONSE_LINE_BYTES {
+        return Err(ImapError::Protocol {
+            context: "reading oversized IMAP response line",
+        });
     }
     Ok(trim_line(&line).to_string())
 }
@@ -698,6 +799,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_oversized_response_lines() {
+        let response = format!("* OK {}\r\n", "x".repeat(MAX_RESPONSE_LINE_BYTES));
+        let mut reader = BufReader::new(response.as_bytes());
+        assert!(matches!(
+            read_line(&mut reader).await,
+            Err(ImapError::Protocol {
+                context: "reading oversized IMAP response line"
+            })
+        ));
+    }
+
+    #[tokio::test]
     async fn mailbox_open_uses_read_only_examine() {
         let (client, server) = tokio::io::duplex(1024);
         let (client_read, mut client_write) = tokio::io::split(client);
@@ -720,6 +833,62 @@ mod tests {
             .await
             .unwrap();
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_completion_queues_untagged_mailbox_changes_once() {
+        let (client_stream, server_stream) = tokio::io::duplex(1024);
+        let (client_read, mut client_write) = tokio::io::split(client_stream);
+        let (server_read, mut server_write) = tokio::io::split(server_stream);
+        let mut server_reader = BufReader::new(server_read);
+        let (events_tx, mut events_rx) = mpsc::channel(4);
+        let events_keepalive = events_tx.clone();
+
+        let client = tokio::spawn(async move {
+            let mut client_reader = BufReader::new(client_read);
+            let state =
+                RuntimeState::new(1, 1, 0, Duration::from_secs(60), Duration::from_secs(60));
+            finish_idle(
+                &mut client_reader,
+                &mut client_write,
+                "A0001",
+                Duration::from_secs(1),
+                move || {
+                    queue_mailbox_event(&events_tx, &state, "example-account", "INBOX");
+                },
+            )
+            .await
+        });
+
+        let mut command = String::new();
+        server_reader.read_line(&mut command).await.unwrap();
+        assert_eq!(command, "DONE\r\n");
+        server_write
+            .write_all(b"* 2 EXISTS\r\n* 1 FETCH (FLAGS (\\Seen))\r\n")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            timeout(Duration::from_secs(1), events_rx.recv())
+                .await
+                .unwrap(),
+            Some(())
+        );
+        assert!(
+            !client.is_finished(),
+            "IDLE must wait for its tagged completion"
+        );
+
+        server_write
+            .write_all(b"A0001 OK IDLE terminated\r\n")
+            .await
+            .unwrap();
+        client.await.unwrap().unwrap();
+        assert!(matches!(
+            events_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        drop(events_keepalive);
     }
 
     #[test]

@@ -3,9 +3,11 @@ INSTALL ?= install
 SED ?= sed
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
-SYSTEMD_USER_DIR ?= $(HOME)/.config/systemd/user
+SYSTEMD_USER_DIR ?= $(if $(strip $(XDG_CONFIG_HOME)),$(XDG_CONFIG_HOME),$(HOME)/.config)/systemd/user
+CARGO_TARGET_DIR ?= target
+export CARGO_TARGET_DIR
 BIN := mailwake
-RELEASE_BIN := target/release/$(BIN)
+RELEASE_BIN := $(CARGO_TARGET_DIR)/release/$(BIN)
 
 ifeq ($(BINDIR),$(HOME)/.local/bin)
 SYSTEMD_EXEC_START ?= %h/.local/bin/$(BIN)
@@ -22,7 +24,12 @@ build:
 	$(CARGO) build --locked
 
 release:
+	$(RM) "$(RELEASE_BIN)"
 	$(CARGO) build --release --locked
+	test -x "$(RELEASE_BIN)" || { \
+		echo "native release artifact not found at $(RELEASE_BIN); cross-target make install is unsupported" >&2; \
+		exit 1; \
+	}
 
 install: release
 	$(INSTALL) -d "$(DESTDIR)$(BINDIR)"

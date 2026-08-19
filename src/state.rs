@@ -371,6 +371,7 @@ mod tests {
         let status = state.status_message();
         assert!(status.contains("watching 1 account(s), 1 source(s)"));
         assert!(status.contains("running commands: 0"));
+        assert!(!status.contains("gmail/INBOX"));
         assert!(!status.contains("private-address"));
         assert!(!status.contains("gmail-oauth-token"));
         assert!(!status.contains("gmi sync"));

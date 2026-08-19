@@ -6,7 +6,7 @@ use std::mem;
 use std::os::unix::ffi::OsStrExt;
 use std::time::Duration;
 use tokio::sync::watch;
-use tokio::time::sleep;
+use tokio::time::{Instant, MissedTickBehavior, interval_at};
 use tracing::warn;
 
 #[derive(Clone, Debug)]
@@ -95,16 +95,30 @@ pub async fn run_status_task(
 ) {
     let interval = notifier
         .watchdog_interval()
-        .map(|watchdog| std::cmp::max(Duration::from_secs(1), watchdog / 2))
+        .map(|watchdog| watchdog / 2)
         .unwrap_or(Duration::from_secs(60));
+    let mut periodic = interval_at(Instant::now() + interval, interval);
+    periodic.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     send_runtime_status(&notifier, &state);
 
     loop {
         tokio::select! {
+            biased;
             changed = shutdown.changed() => {
                 if changed.is_ok() && *shutdown.borrow() {
                     break;
+                }
+            }
+            _ = periodic.tick() => {
+                send_runtime_status(&notifier, &state);
+                if notifier.watchdog_interval().is_some() {
+                    if let Some(reason) = state.health_problem() {
+                        warn!(%reason, "runtime health check failed; withholding systemd watchdog ping");
+                        let _ = notifier.status(&unhealthy_status_message(&state));
+                    } else if let Err(error) = notifier.watchdog() {
+                        warn!(%error, "failed to send systemd watchdog notification");
+                    }
                 }
             }
             changed = status_changes.changed() => {
@@ -112,19 +126,6 @@ pub async fn run_status_task(
                     break;
                 }
                 send_runtime_status(&notifier, &state);
-            }
-            () = sleep(interval) => {
-                send_runtime_status(&notifier, &state);
-                if notifier.watchdog_interval().is_some() {
-                    if let Some(reason) = state.health_problem() {
-                        warn!(%reason, "runtime health check failed; withholding systemd watchdog ping");
-                        let _ = notifier.status(&unhealthy_status_message(&state));
-                    } else {
-                        if let Err(error) = notifier.watchdog() {
-                            warn!(%error, "failed to send systemd watchdog notification");
-                        }
-                    }
-                }
             }
         }
     }
@@ -257,7 +258,7 @@ mod tests {
 
     #[test]
     fn unhealthy_status_omits_health_reason_identifiers() {
-        let state = RuntimeState::new(1, 0, 0, Duration::from_secs(60), Duration::from_secs(60));
+        let state = RuntimeState::new(1, 1, 0, Duration::from_secs(60), Duration::from_secs(60));
         state.register_watcher("private-source-name");
         state.mark_watcher("private-source-name", WatcherPhase::Crashed);
 
@@ -307,6 +308,55 @@ mod tests {
             .expect("receive running status notification");
         let running = std::str::from_utf8(&buffer[..running_size]).expect("UTF-8 status");
         assert!(running.contains("running commands: 1"));
+
+        shutdown_tx
+            .send(true)
+            .expect("request status task shutdown");
+        task.await.expect("status task joins");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn status_changes_do_not_postpone_watchdog_pings() {
+        let tempdir = tempfile::tempdir().expect("temporary notify socket directory");
+        let socket_path = tempdir.path().join("notify.sock");
+        let socket = tokio::net::UnixDatagram::bind(&socket_path).expect("bind notify socket");
+        let notifier = Notifier {
+            socket: Some(socket_path.into_os_string()),
+            watchdog_interval: Some(Duration::from_secs(10)),
+        };
+        let state = Arc::new(RuntimeState::new(
+            0,
+            0,
+            0,
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        ));
+        let (status_tx, status_rx) = watch::channel(0_u64);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(run_status_task(
+            notifier,
+            Arc::clone(&state),
+            status_rx,
+            shutdown_rx,
+        ));
+        tokio::task::yield_now().await;
+
+        for revision in 1..=5 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            status_tx.send(revision).expect("send status revision");
+            tokio::task::yield_now().await;
+        }
+
+        let mut found_watchdog = false;
+        let mut buffer = [0_u8; 512];
+        while let Ok(size) = socket.try_recv(&mut buffer) {
+            let message = std::str::from_utf8(&buffer[..size]).expect("UTF-8 notification");
+            found_watchdog |= message.contains("WATCHDOG=1");
+        }
+        assert!(
+            found_watchdog,
+            "frequent status changes must not reset the watchdog deadline"
+        );
 
         shutdown_tx
             .send(true)

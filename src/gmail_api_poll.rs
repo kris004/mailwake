@@ -15,6 +15,7 @@ use tracing::{debug, info, warn};
 const GMAIL_API_ROOT: &str = "https://gmail.googleapis.com/gmail/v1/users/me";
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
+const MAX_GOOGLE_ERROR_BODY_BYTES: usize = 64 * 1024;
 
 pub const INITIAL_AUTH_FAILURE_PREFIX: &str = "Gmail API poller authentication failed";
 
@@ -55,6 +56,7 @@ pub enum GmailApiPollError {
     HttpStatus {
         operation: &'static str,
         status: StatusCode,
+        reason: Option<GoogleErrorReason>,
     },
     #[error("Gmail history baseline is too old")]
     StaleHistory,
@@ -66,13 +68,59 @@ impl GmailApiPollError {
     pub fn is_permanent_auth_failure(&self) -> bool {
         matches!(
             self,
-            Self::Auth(_)
+            Self::Auth(AuthError::HelperReauthRequired)
                 | Self::HttpStatus {
-                    status: StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN,
+                    status: StatusCode::UNAUTHORIZED,
+                    ..
+                }
+                | Self::HttpStatus {
+                    status: StatusCode::FORBIDDEN,
+                    reason: Some(
+                        GoogleErrorReason::InsufficientPermissions
+                            | GoogleErrorReason::DomainPolicy
+                    ),
                     ..
                 }
         )
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GoogleErrorReason {
+    InsufficientPermissions,
+    DomainPolicy,
+    DailyLimitExceeded,
+    RateLimitExceeded,
+    UserRateLimitExceeded,
+}
+
+impl GoogleErrorReason {
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "insufficientPermissions" => Some(Self::InsufficientPermissions),
+            "domainPolicy" => Some(Self::DomainPolicy),
+            "dailyLimitExceeded" => Some(Self::DailyLimitExceeded),
+            "rateLimitExceeded" => Some(Self::RateLimitExceeded),
+            "userRateLimitExceeded" => Some(Self::UserRateLimitExceeded),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct GoogleErrorEnvelope {
+    error: GoogleErrorBody,
+}
+
+#[derive(Debug, Deserialize)]
+struct GoogleErrorBody {
+    #[serde(default)]
+    errors: Vec<GoogleErrorDetail>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GoogleErrorDetail {
+    reason: Option<String>,
 }
 
 #[derive(Clone)]
@@ -388,7 +436,7 @@ async fn token_from_helper(
 }
 
 async fn decode_response<T: DeserializeOwned>(
-    response: reqwest::Response,
+    mut response: reqwest::Response,
     operation: &'static str,
 ) -> Result<T, GmailApiPollError> {
     let status = response.status();
@@ -396,12 +444,51 @@ async fn decode_response<T: DeserializeOwned>(
         return Err(GmailApiPollError::StaleHistory);
     }
     if !status.is_success() {
-        return Err(GmailApiPollError::HttpStatus { operation, status });
+        let reason = if status == StatusCode::FORBIDDEN {
+            read_google_error_reason(&mut response).await
+        } else {
+            None
+        };
+        return Err(GmailApiPollError::HttpStatus {
+            operation,
+            status,
+            reason,
+        });
     }
     response
         .json::<T>()
         .await
         .map_err(|source| GmailApiPollError::Request { operation, source })
+}
+
+async fn read_google_error_reason(response: &mut reqwest::Response) -> Option<GoogleErrorReason> {
+    let mut body = Vec::new();
+    loop {
+        let chunk = match response.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(_) => return None,
+        };
+        if body.len().saturating_add(chunk.len()) > MAX_GOOGLE_ERROR_BODY_BYTES {
+            return None;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    parse_google_error_reason(&body)
+}
+
+fn parse_google_error_reason(body: &[u8]) -> Option<GoogleErrorReason> {
+    if body.len() > MAX_GOOGLE_ERROR_BODY_BYTES {
+        return None;
+    }
+
+    let response = serde_json::from_slice::<GoogleErrorEnvelope>(body).ok()?;
+    response
+        .error
+        .errors
+        .iter()
+        .filter_map(|error| error.reason.as_deref())
+        .find_map(GoogleErrorReason::from_str)
 }
 
 fn parse_history_id(value: &str, context: &'static str) -> Result<u64, GmailApiPollError> {
@@ -516,7 +603,7 @@ mod tests {
     }
 
     #[test]
-    fn auth_and_permission_errors_are_permanent() {
+    fn explicit_reauthorization_and_unauthorized_errors_are_permanent() {
         assert!(
             GmailApiPollError::Auth(AuthError::HelperReauthRequired).is_permanent_auth_failure()
         );
@@ -524,13 +611,71 @@ mod tests {
             GmailApiPollError::HttpStatus {
                 operation: "getProfile",
                 status: StatusCode::UNAUTHORIZED,
+                reason: None,
             }
             .is_permanent_auth_failure()
         );
+    }
+
+    #[test]
+    fn transient_and_malformed_helper_failures_are_retryable() {
+        let errors = [
+            AuthError::HelperTimedOut { seconds: 5 },
+            AuthError::HelperFailed {
+                status: "exit status: 1".to_string(),
+            },
+            AuthError::HelperOutputTooLarge { limit: 1024 },
+            AuthError::HelperOutputUtf8,
+            AuthError::EmptySecret,
+        ];
+        for error in errors {
+            assert!(!GmailApiPollError::Auth(error).is_permanent_auth_failure());
+        }
+
+        let start_error = AuthError::HelperStart {
+            source: std::io::Error::other("temporary failure"),
+        };
+        assert!(!GmailApiPollError::Auth(start_error).is_permanent_auth_failure());
+    }
+
+    #[test]
+    fn known_google_permission_reasons_are_permanent() {
+        for reason in [
+            GoogleErrorReason::InsufficientPermissions,
+            GoogleErrorReason::DomainPolicy,
+        ] {
+            assert!(
+                GmailApiPollError::HttpStatus {
+                    operation: "getProfile",
+                    status: StatusCode::FORBIDDEN,
+                    reason: Some(reason),
+                }
+                .is_permanent_auth_failure()
+            );
+        }
+    }
+
+    #[test]
+    fn quota_rate_and_ambiguous_http_errors_are_retryable() {
+        for reason in [
+            GoogleErrorReason::DailyLimitExceeded,
+            GoogleErrorReason::RateLimitExceeded,
+            GoogleErrorReason::UserRateLimitExceeded,
+        ] {
+            assert!(
+                !GmailApiPollError::HttpStatus {
+                    operation: "getProfile",
+                    status: StatusCode::FORBIDDEN,
+                    reason: Some(reason),
+                }
+                .is_permanent_auth_failure()
+            );
+        }
         assert!(
-            GmailApiPollError::HttpStatus {
+            !GmailApiPollError::HttpStatus {
                 operation: "getProfile",
                 status: StatusCode::FORBIDDEN,
+                reason: None,
             }
             .is_permanent_auth_failure()
         );
@@ -538,8 +683,54 @@ mod tests {
             !GmailApiPollError::HttpStatus {
                 operation: "getProfile",
                 status: StatusCode::TOO_MANY_REQUESTS,
+                reason: None,
             }
             .is_permanent_auth_failure()
         );
+        assert!(
+            !GmailApiPollError::HttpStatus {
+                operation: "getProfile",
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                reason: None,
+            }
+            .is_permanent_auth_failure()
+        );
+    }
+
+    #[test]
+    fn google_error_reason_parser_accepts_only_bounded_known_reason_fields() {
+        let cases = [
+            (
+                "insufficientPermissions",
+                GoogleErrorReason::InsufficientPermissions,
+            ),
+            ("domainPolicy", GoogleErrorReason::DomainPolicy),
+            ("dailyLimitExceeded", GoogleErrorReason::DailyLimitExceeded),
+            ("rateLimitExceeded", GoogleErrorReason::RateLimitExceeded),
+            (
+                "userRateLimitExceeded",
+                GoogleErrorReason::UserRateLimitExceeded,
+            ),
+        ];
+        for (value, expected) in cases {
+            let body = format!(
+                r#"{{"error":{{"errors":[{{"domain":"usageLimits","reason":"{value}"}}]}}}}"#
+            );
+            assert_eq!(parse_google_error_reason(body.as_bytes()), Some(expected));
+        }
+
+        assert_eq!(
+            parse_google_error_reason(br#"{"error":{"errors":[{"reason":"backendError"}]}}"#),
+            None
+        );
+        assert_eq!(
+            parse_google_error_reason(
+                br#"{"error":{"message":"\"reason\": \"insufficientPermissions\""}}"#
+            ),
+            None
+        );
+
+        let oversized = vec![b' '; MAX_GOOGLE_ERROR_BODY_BYTES + 1];
+        assert_eq!(parse_google_error_reason(&oversized), None);
     }
 }

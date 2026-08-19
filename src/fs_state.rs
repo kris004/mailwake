@@ -120,7 +120,6 @@ impl From<ShellProcessError> for StateReadError {
 pub enum FsStateEvent {
     Changed,
     Overflow,
-    Startup,
 }
 
 pub struct FsStateRunner {
@@ -338,13 +337,8 @@ impl FsStateRunner {
                     }
                 }
                 event = events.recv() => {
-                    match event? {
-                        FsStateEvent::Startup => return Some(SourceWork::StartupTrigger),
-                        event => {
-                            self.record_event(event);
-                            return Some(SourceWork::FilesystemEvent(Instant::now()));
-                        }
-                    }
+                    self.record_event(event?);
+                    return Some(SourceWork::FilesystemEvent(Instant::now()));
                 }
             }
         }
@@ -718,7 +712,7 @@ impl FsStateRunner {
             state.mark_event();
         }
         match event {
-            FsStateEvent::Changed | FsStateEvent::Startup => {}
+            FsStateEvent::Changed => {}
             FsStateEvent::Overflow => {
                 warn!(
                     source = %self.source,
@@ -1328,34 +1322,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queued_startup_event_waits_for_baseline_then_triggers_and_rebaselines() {
-        let reader = Arc::new(TestStateReader::new(&["base", "after"]));
-        let trigger = Arc::new(TestTrigger::new(Duration::ZERO));
-        let (events_tx, events_rx) = mpsc::channel(64);
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let runner = FsStateRunner::new_with_settle(
-            "local",
-            Duration::from_millis(5),
-            Duration::from_millis(50),
-            Duration::ZERO,
-            Some(reader.clone() as Arc<dyn StateReader>),
-            trigger.clone(),
-            None,
-        );
-        let handle = tokio::spawn(runner.run(events_rx, shutdown_rx));
-
-        wait_for_calls(&reader.calls, 1).await;
-        assert_eq!(trigger.calls.load(Ordering::SeqCst), 0);
-        events_tx.send(FsStateEvent::Startup).await.unwrap();
-        wait_for_calls(&trigger.calls, 1).await;
-        wait_for_calls(&reader.calls, 2).await;
-        assert_eq!(trigger.calls.load(Ordering::SeqCst), 1);
-
-        let _ = shutdown_tx.send(true);
-        handle.await.unwrap();
-    }
-
-    #[tokio::test]
     async fn run_on_startup_waits_for_baseline_then_triggers_and_rebaselines() {
         let reader = Arc::new(TestStateReader::new(&["base", "after"]));
         let trigger = Arc::new(TestTrigger::new(Duration::ZERO));
@@ -1379,6 +1345,38 @@ mod tests {
         startup_tx.send(true).unwrap();
         wait_for_calls(&trigger.calls, 1).await;
         wait_for_calls(&reader.calls, 2).await;
+        assert_eq!(trigger.calls.load(Ordering::SeqCst), 1);
+
+        let _ = shutdown_tx.send(true);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_on_startup_is_not_swallowed_by_a_filesystem_batch() {
+        let reader = Arc::new(TestStateReader::new(&["base", "base", "after"]));
+        let trigger = Arc::new(TestTrigger::new(Duration::ZERO));
+        let (events_tx, events_rx) = mpsc::channel(64);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (startup_tx, startup_rx) = watch::channel(false);
+        let runner = FsStateRunner::new_with_settle(
+            "local",
+            Duration::from_millis(50),
+            Duration::from_millis(200),
+            Duration::ZERO,
+            Some(reader.clone() as Arc<dyn StateReader>),
+            trigger.clone(),
+            None,
+        );
+        let handle =
+            tokio::spawn(runner.run_with_startup_signal(events_rx, shutdown_rx, startup_rx));
+
+        wait_for_calls(&reader.calls, 1).await;
+        events_tx.send(FsStateEvent::Changed).await.unwrap();
+        sleep(Duration::from_millis(10)).await;
+        startup_tx.send(true).unwrap();
+
+        wait_for_calls(&trigger.calls, 1).await;
+        wait_for_calls(&reader.calls, 3).await;
         assert_eq!(trigger.calls.load(Ordering::SeqCst), 1);
 
         let _ = shutdown_tx.send(true);

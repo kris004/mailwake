@@ -8,7 +8,9 @@ supplied systemd user services.
 `mailwake` treats source activity as a reason to reconcile current state. It
 does not persist or replay individual events.
 
-- Events during a debounce window are coalesced.
+- Events during a debounce window are coalesced. IMAP and Gmail measure that
+  window from the first event; `fs_state` waits for a quiet period, bounded by
+  `max_debounce_seconds`.
 - Events that arrive during a command's cooldown are coalesced into a later
   request.
 - Only one command in a lane runs at a time.
@@ -50,8 +52,9 @@ baseline.
 | --- | --- |
 | Invalid or unreadable configuration | Startup exits nonzero with a safe path/reason message. |
 | Transient IMAP, Gmail API, or network failure | Source retries with backoff. |
-| Credential helper fails or remote authentication is rejected | Daemon stops; reauthorization-required failures use exit `78`. |
-| Gmail API returns a permission rejection | Daemon stops with exit `78`. |
+| IMAP credential helper fails or remote authentication is rejected | Daemon stops with exit `78`. |
+| Gmail helper explicitly requests reauthorization, or Gmail returns HTTP 401 or a known permission rejection | Daemon stops with exit `78`. |
+| Gmail helper fails transiently, or Gmail returns a quota/rate-limit response | Source retries with backoff. |
 | IMAP rejects a mailbox/protocol command | Source reconnects with backoff. |
 | Configured command fails or times out | Run fails; daemon remains active. |
 | `state_cmd` fails | Source remains unreconciled and retries on later work. |
@@ -160,6 +163,30 @@ systemctl --user status mailwake.service
 the default `%h/.local/bin/mailwake` path when copied directly.
 Make variables are not persisted between invocations, so pass the same custom
 `PREFIX` or `BINDIR` to both `make install` and the systemd install target.
+The unit is installed under `${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user`;
+override `SYSTEMD_USER_DIR` when packaging or using another layout.
+
+Generated units support the default and conventional absolute binary paths.
+Do not use a `BINDIR` containing whitespace or `sed`/systemd metacharacters with
+the systemd install targets; install and edit the example unit deliberately for
+such an unusual path.
+
+For a system-wide binary with a per-user service, split privileged and user
+installation so the unit is not written under root's home:
+
+```sh
+sudo make PREFIX=/usr/local install
+make PREFIX=/usr/local install-systemd
+```
+
+Distribution packagers can stage both artifacts without embedding `DESTDIR` in
+the runtime path:
+
+```sh
+make DESTDIR="$pkgdir" PREFIX=/usr install
+make DESTDIR="$pkgdir" PREFIX=/usr \
+  SYSTEMD_USER_DIR=/usr/lib/systemd/user install-systemd
+```
 
 The daemon handles unavailable networks by reconnecting, so the example user
 unit does not depend on a commonly absent user-level `network-online.target`.
@@ -184,12 +211,12 @@ systemctl --user daemon-reload
 
 ## Hardened systemd example
 
-Install the alternative unit with:
+Install and enable the alternative unit with:
 
 ```sh
 make install-systemd-hardened
 systemctl --user daemon-reload
-systemctl --user restart mailwake.service
+systemctl --user enable --now mailwake.service
 ```
 
 It adds:
@@ -214,6 +241,11 @@ non-fatal when it does not exist.
 Some password managers, OAuth helpers, desktop keyrings, and IPC mechanisms need
 additional sockets, address families, or writable paths. Review the complete
 command chain before enabling the hardened unit.
+
+A user service follows the lifecycle of the user's systemd manager. If it must
+run before login or remain active after logout, enable lingering for that user
+according to the host's systemd policy; this changes the lifecycle of every user
+service, not only `mailwake`.
 
 ## Shutdown
 

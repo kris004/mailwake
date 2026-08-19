@@ -51,11 +51,12 @@ stdout/stderr from these helpers. Helper output is capped by
 is killed and no output is included in the error. OAuth refresh belongs in the
 helper, not in the daemon.
 
-Auth failures are fail-stop, not reconnect-loop events. Helper failures and IMAP
-authentication rejection, plus Gmail API authentication/permission rejection,
-stop the daemon so an operator can see and fix the problem. A helper may exit
-`78` to classify the failure as "user action or reauthorization required"; the
-daemon propagates that exit status so supervisors can avoid useless restarts.
+IMAP helper failures and authentication rejection are fail-stop events. For the
+Gmail API source, an explicit helper exit `78`, HTTP 401, and known permission
+rejections are fail-stop; other helper failures and quota/rate-limit responses
+retry with backoff. This avoids turning a temporary Google limit or helper
+timeout into a false reauthorization request. The daemon propagates fail-stop
+authentication errors as exit `78` so supervisors can avoid useless restarts.
 
 Direct `password` exists only for local testing and intentionally emits a warning
 without printing the password value.

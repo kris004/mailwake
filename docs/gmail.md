@@ -150,6 +150,12 @@ filtering uses `users.history.list` before the command is submitted. The
 baseline is in memory and is recreated at process start; `run_on_startup` makes
 the sync command reconcile that gap.
 
+The API poller stops the daemon for an explicit helper exit `78`, HTTP 401, or a
+known permission rejection. Transient helper failures, ambiguous or quota-based
+HTTP 403 responses, HTTP 429, and server errors retry with exponential backoff.
+Only the bounded structured error reason is inspected; Google response bodies
+are not included in logs.
+
 ## IMAP IDLE example
 
 ```toml

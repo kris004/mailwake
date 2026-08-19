@@ -37,6 +37,19 @@ jobs:
       - name: Run tests
         run: cargo +stable test --locked
 
+      - name: Verify public install targets
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/mailwake-target
+        run: |
+          prefix="${RUNNER_TEMP}/mailwake-prefix"
+          units="${RUNNER_TEMP}/mailwake-units"
+          make CARGO="cargo +stable" PREFIX="$prefix" install
+          "$prefix/bin/mailwake" --version
+          make PREFIX="$prefix" SYSTEMD_USER_DIR="$units" install-systemd
+          systemd-analyze --user verify "$units/mailwake.service"
+          make PREFIX="$prefix" SYSTEMD_USER_DIR="$units" install-systemd-hardened
+          systemd-analyze --user verify "$units/mailwake.service"
+
       - name: Check shell helper syntax
         run: sh -n contrib/oauth/gmail-oauth-token-oauth2l
 

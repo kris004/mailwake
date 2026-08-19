@@ -7,7 +7,7 @@ use thiserror::Error;
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
-use tokio::time::{Instant, sleep, timeout};
+use tokio::time::{Instant, sleep, sleep_until, timeout};
 
 const TERMINATE_GRACE: Duration = Duration::from_secs(2);
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -214,49 +214,51 @@ pub async fn run_shell_process_with_streams(
         .stderr
         .take()
         .map(|pipe| read_pipe(pipe, "stderr", shared_limit.clone(), limit_tx.clone()));
+    drop(limit_tx);
     let mut limit_rx = shared_limit.map(|_| limit_rx);
 
     let mut shutdown = shutdown;
-    let end = wait_for_child(
-        &mut child,
-        pgid,
-        command_timeout,
-        &mut shutdown,
-        &mut limit_rx,
-    )
-    .await?;
+    let deadline = Instant::now() + command_timeout;
+    let end = wait_for_child(&mut child, pgid, deadline, &mut shutdown, &mut limit_rx).await?;
 
-    let run = match end {
-        End::Completed(status) => match collect_captured_output(stdout_task, stderr_task).await? {
-            CollectedOutput::Captured(captured) => {
-                ShellRun::Completed(ShellOutput::new(status, captured))
-            }
-            CollectedOutput::TooLarge(first, captured) => {
-                ShellRun::OutputLimitExceeded(OutputLimitExceeded::new(first, captured))
-            }
-        },
-        End::TimedOut => match collect_captured_output(stdout_task, stderr_task).await? {
-            CollectedOutput::Captured(captured) => ShellRun::TimedOut(captured),
-            CollectedOutput::TooLarge(first, captured) => {
-                ShellRun::OutputLimitExceeded(OutputLimitExceeded::new(first, captured))
-            }
-        },
-        End::Cancelled => match collect_captured_output(stdout_task, stderr_task).await? {
-            CollectedOutput::Captured(captured) => ShellRun::Cancelled(captured),
-            CollectedOutput::TooLarge(first, captured) => {
-                ShellRun::OutputLimitExceeded(OutputLimitExceeded::new(first, captured))
-            }
-        },
-        End::OutputLimitExceeded(first) => {
-            match collect_captured_output(stdout_task, stderr_task).await? {
-                CollectedOutput::Captured(captured) | CollectedOutput::TooLarge(_, captured) => {
-                    ShellRun::OutputLimitExceeded(OutputLimitExceeded::new(first, captured))
-                }
-            }
+    let (end, captured) = match end {
+        End::Completed(status) => {
+            collect_after_child_exit(
+                status,
+                stdout_task,
+                stderr_task,
+                &mut child,
+                pgid,
+                deadline,
+                &mut shutdown,
+                &mut limit_rx,
+            )
+            .await?
         }
+        end => (
+            end,
+            collect_captured_output(stdout_task, stderr_task).await?,
+        ),
     };
 
-    Ok(run)
+    Ok(finish_shell_run(end, captured))
+}
+
+fn finish_shell_run(end: End, captured: CollectedOutput) -> ShellRun {
+    match (end, captured) {
+        (
+            End::OutputLimitExceeded(first),
+            CollectedOutput::Captured(captured) | CollectedOutput::TooLarge(_, captured),
+        )
+        | (_, CollectedOutput::TooLarge(first, captured)) => {
+            ShellRun::OutputLimitExceeded(OutputLimitExceeded::new(first, captured))
+        }
+        (End::Completed(status), CollectedOutput::Captured(captured)) => {
+            ShellRun::Completed(ShellOutput::new(status, captured))
+        }
+        (End::TimedOut, CollectedOutput::Captured(captured)) => ShellRun::TimedOut(captured),
+        (End::Cancelled, CollectedOutput::Captured(captured)) => ShellRun::Cancelled(captured),
+    }
 }
 
 fn configure_stdio(
@@ -315,11 +317,10 @@ impl SharedOutputLimit {
 async fn wait_for_child(
     child: &mut Child,
     pgid: Option<libc::pid_t>,
-    command_timeout: Duration,
+    deadline: Instant,
     shutdown: &mut Option<watch::Receiver<bool>>,
     limit_rx: &mut Option<mpsc::UnboundedReceiver<PipeLimitExceeded>>,
 ) -> Result<End, ShellProcessError> {
-    let deadline = Instant::now() + command_timeout;
     loop {
         if let Some(status) = child
             .try_wait()
@@ -398,6 +399,74 @@ async fn wait_for_child(
             }
             (None, None) => {
                 tick.await;
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn collect_after_child_exit(
+    status: ExitStatus,
+    stdout_task: Option<JoinHandle<Result<Vec<u8>, PipeReadError>>>,
+    stderr_task: Option<JoinHandle<Result<Vec<u8>, PipeReadError>>>,
+    child: &mut Child,
+    pgid: Option<libc::pid_t>,
+    deadline: Instant,
+    shutdown: &mut Option<watch::Receiver<bool>>,
+    limit_rx: &mut Option<mpsc::UnboundedReceiver<PipeLimitExceeded>>,
+) -> Result<(End, CollectedOutput), ShellProcessError> {
+    let collection = collect_captured_output(stdout_task, stderr_task);
+    tokio::pin!(collection);
+    let deadline_sleep = sleep_until(deadline);
+    tokio::pin!(deadline_sleep);
+
+    loop {
+        tokio::select! {
+            biased;
+            captured = &mut collection => return Ok((End::Completed(status), captured?)),
+            exceeded = async {
+                limit_rx
+                    .as_mut()
+                    .expect("output limit receiver is present")
+                    .recv()
+                    .await
+            }, if limit_rx.is_some() => {
+                if let Some(exceeded) = exceeded {
+                    terminate_process_group(child, pgid)
+                        .await
+                        .map_err(|source| ShellProcessError::Wait { source })?;
+                    return Ok((End::OutputLimitExceeded(exceeded), collection.await?));
+                }
+                *limit_rx = None;
+            }
+            shutdown_state = async {
+                let receiver = shutdown
+                    .as_mut()
+                    .expect("shutdown receiver is present");
+                if *receiver.borrow() {
+                    return Some(true);
+                }
+                match receiver.changed().await {
+                    Ok(()) => Some(*receiver.borrow()),
+                    Err(_) => None,
+                }
+            }, if shutdown.is_some() => {
+                match shutdown_state {
+                    Some(true) => {
+                        terminate_process_group(child, pgid)
+                            .await
+                            .map_err(|source| ShellProcessError::Wait { source })?;
+                        return Ok((End::Cancelled, collection.await?));
+                    }
+                    Some(false) => {}
+                    None => *shutdown = None,
+                }
+            }
+            () = &mut deadline_sleep => {
+                terminate_process_group(child, pgid)
+                    .await
+                    .map_err(|source| ShellProcessError::Wait { source })?;
+                return Ok((End::TimedOut, collection.await?));
             }
         }
     }
@@ -557,3 +626,165 @@ fn configure_process_group(process: &mut Command) {
 
 #[cfg(not(unix))]
 fn configure_process_group(_process: &mut Command) {}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::Path;
+
+    use tempfile::tempdir;
+    use tokio::task::JoinHandle;
+
+    use super::*;
+
+    const TEST_PROCESS_WAIT: Duration = Duration::from_secs(2);
+
+    struct ProcessGuard(Option<libc::pid_t>);
+
+    impl ProcessGuard {
+        fn new(pid: libc::pid_t) -> Self {
+            Self(Some(pid))
+        }
+
+        fn disarm(&mut self) {
+            self.0 = None;
+        }
+    }
+
+    impl Drop for ProcessGuard {
+        fn drop(&mut self) {
+            if let Some(pid) = self.0 {
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn timeout_remains_active_while_descendant_holds_capture_pipes() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let pid_file = directory.path().join("pids");
+        let mut runner = spawn_background_sleep(&pid_file, Duration::from_millis(500), None);
+        let (shell_pid, descendant_pid) = read_pids(&pid_file).await;
+        let mut descendant_guard = ProcessGuard::new(descendant_pid);
+
+        assert!(
+            wait_for_process_exit(shell_pid, Duration::from_millis(250)).await,
+            "shell should exit before the command deadline"
+        );
+        assert!(process_exists(descendant_pid));
+
+        let run = wait_for_runner(&mut runner).await;
+        assert!(matches!(run, ShellRun::TimedOut(_)));
+        assert!(
+            wait_for_process_exit(descendant_pid, TEST_PROCESS_WAIT).await,
+            "timed-out descendant should be terminated"
+        );
+        descendant_guard.disarm();
+    }
+
+    #[tokio::test]
+    async fn shutdown_remains_active_while_descendant_holds_capture_pipes() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let pid_file = directory.path().join("pids");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut runner =
+            spawn_background_sleep(&pid_file, Duration::from_secs(10), Some(shutdown_rx));
+        let (shell_pid, descendant_pid) = read_pids(&pid_file).await;
+        let mut descendant_guard = ProcessGuard::new(descendant_pid);
+
+        assert!(
+            wait_for_process_exit(shell_pid, TEST_PROCESS_WAIT).await,
+            "shell should exit before shutdown is requested"
+        );
+        assert!(process_exists(descendant_pid));
+        shutdown_tx
+            .send(true)
+            .expect("shutdown receiver should remain open");
+
+        let run = wait_for_runner(&mut runner).await;
+        assert!(matches!(run, ShellRun::Cancelled(_)));
+        assert!(
+            wait_for_process_exit(descendant_pid, TEST_PROCESS_WAIT).await,
+            "cancelled descendant should be terminated"
+        );
+        descendant_guard.disarm();
+    }
+
+    fn spawn_background_sleep(
+        pid_file: &Path,
+        command_timeout: Duration,
+        shutdown: Option<watch::Receiver<bool>>,
+    ) -> JoinHandle<Result<ShellRun, ShellProcessError>> {
+        let pid_file = shell_words::quote(
+            pid_file
+                .to_str()
+                .expect("temporary path should contain valid UTF-8"),
+        );
+        let command = format!("sleep 10 & printf '%s %s\\n' \"$$\" \"$!\" > {pid_file}");
+        tokio::spawn(async move {
+            run_shell_process(&command, true, true, command_timeout, None, shutdown).await
+        })
+    }
+
+    async fn read_pids(pid_file: &Path) -> (libc::pid_t, libc::pid_t) {
+        let deadline = Instant::now() + TEST_PROCESS_WAIT;
+        loop {
+            if let Ok(contents) = fs::read_to_string(pid_file) {
+                let mut values = contents.split_whitespace();
+                let shell_pid = values
+                    .next()
+                    .expect("shell PID should be present")
+                    .parse()
+                    .expect("shell PID should be numeric");
+                let descendant_pid = values
+                    .next()
+                    .expect("descendant PID should be present")
+                    .parse()
+                    .expect("descendant PID should be numeric");
+                return (shell_pid, descendant_pid);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "background command should write its PIDs"
+            );
+            sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn wait_for_runner(
+        runner: &mut JoinHandle<Result<ShellRun, ShellProcessError>>,
+    ) -> ShellRun {
+        match timeout(TEST_PROCESS_WAIT, &mut *runner).await {
+            Ok(result) => result
+                .expect("runner task should complete")
+                .expect("shell process should run"),
+            Err(_) => {
+                runner.abort();
+                panic!("shell process should remain bounded");
+            }
+        }
+    }
+
+    async fn wait_for_process_exit(pid: libc::pid_t, wait: Duration) -> bool {
+        let deadline = Instant::now() + wait;
+        loop {
+            if !process_exists(pid) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    fn process_exists(pid: libc::pid_t) -> bool {
+        let result = unsafe { libc::kill(pid, 0) };
+        if result == 0 {
+            return true;
+        }
+        io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+}

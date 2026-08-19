@@ -781,6 +781,7 @@ dependencies = [
  "notify",
  "reqwest",
  "serde",
+ "serde_json",
  "shell-words",
  "tempfile",
  "thiserror",

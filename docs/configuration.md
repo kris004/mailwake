@@ -41,7 +41,7 @@ All fields are optional. Defaults are shown below.
 
 | Field | Default | Constraint or meaning |
 | --- | ---: | --- |
-| `default_debounce_seconds` | `10` | Quiet period before a source submits a command. Zero disables debounce. |
+| `default_debounce_seconds` | `10` | Coalescing window before a source submits a command. Zero disables debounce. `fs_state` treats it as a quiet period; IMAP and Gmail measure it from the first event. |
 | `default_max_debounce_seconds` | `60` | Maximum settling delay for `fs_state`; must be nonzero. |
 | `auth_helper_timeout_seconds` | `30` | Credential-helper timeout; must be nonzero. |
 | `auth_helper_max_output_bytes` | `65536` | Credential-helper output cap; must be nonzero. |
@@ -186,9 +186,9 @@ submit `on_event`; message data is not passed to the command.
 `run_on_startup` defaults to `false`. Enable it when the command should
 reconcile changes that may have occurred while the daemon was offline.
 
-Network and protocol timeouts reconnect with exponential backoff. Authentication
-rejection and credential-helper failures are fail-stop errors rather than
-infinite reconnect conditions.
+Network and protocol timeouts reconnect with exponential backoff. IMAP
+authentication rejection and credential-helper failures are fail-stop errors
+rather than infinite reconnect conditions.
 
 ## `gmail_api_poll`
 
@@ -223,7 +223,7 @@ it either triggers immediately or uses `users.history.list` to check configured
 | `gmail_token_cmd` | required | Helper that prints one OAuth bearer token. |
 | `label_ids` | `[]` | Optional Gmail label-id filter. |
 | `run_on_startup` | `false` | Submit the normal command once after startup readiness. |
-| `debounce_seconds` | global default | Quiet period before command submission; zero disables debounce. |
+| `debounce_seconds` | global default | Coalescing window measured from the first event; zero disables debounce. |
 | `poll_interval_seconds` | `60` | Minimum `10`. |
 | `api_timeout_seconds` | `60` | Must be nonzero. |
 | `history_page_size` | `100` | Range `1..=500`. |
@@ -232,6 +232,9 @@ The history baseline is in memory and is established again after every process
 start. Use `run_on_startup = true` when the external command must reconcile
 possible downtime. If Gmail says a history baseline is too old, the source
 triggers once and rebaselines so the external command can repair local state.
+An explicit helper exit status `78`, HTTP 401, or a known permission rejection
+stops the daemon. Other helper failures and Gmail quota or rate-limit responses
+retry with exponential backoff.
 
 See [Gmail/IMAP integration](gmail.md) for OAuth and sync-command examples.
 
