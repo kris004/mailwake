@@ -22,3 +22,6 @@ and local paths.
   for known private usernames, email addresses, account names, and local paths.
 - Validate Rust changes with `cargo fmt`, `cargo clippy --all-targets
   --all-features --locked -- -D warnings`, and `cargo test --locked`.
+- Preserve unrelated dirty work and stage exact paths.
+- Do not change visibility, push, publish, or create a release without explicit
+  authorization.
