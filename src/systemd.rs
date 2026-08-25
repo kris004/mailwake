@@ -230,10 +230,29 @@ fn send_datagram_with_fd(
 
 #[cfg(test)]
 mod tests {
+    use std::os::fd::AsRawFd;
     use std::sync::Arc;
 
     use super::*;
     use crate::state::{RuntimeState, WatcherPhase};
+
+    fn bind_short_notify_socket() -> (
+        tempfile::TempDir,
+        std::fs::File,
+        OsString,
+        tokio::net::UnixDatagram,
+    ) {
+        // Keep the socket node inside the inherited temporary directory while
+        // using a short proc-fd alias that cannot overflow sockaddr_un::sun_path.
+        let tempdir = tempfile::tempdir().expect("temporary notify socket directory");
+        let tempdir_fd =
+            std::fs::File::open(tempdir.path()).expect("open temporary notify socket directory");
+        let socket_path = std::path::Path::new("/proc/self/fd")
+            .join(tempdir_fd.as_raw_fd().to_string())
+            .join("notify.sock");
+        let socket = tokio::net::UnixDatagram::bind(&socket_path).expect("bind notify socket");
+        (tempdir, tempdir_fd, socket_path.into_os_string(), socket)
+    }
 
     #[test]
     fn disabled_notifier_is_noop() {
@@ -269,11 +288,9 @@ mod tests {
 
     #[tokio::test]
     async fn status_task_sends_command_activity_changes_immediately() {
-        let tempdir = tempfile::tempdir().expect("temporary notify socket directory");
-        let socket_path = tempdir.path().join("notify.sock");
-        let socket = tokio::net::UnixDatagram::bind(&socket_path).expect("bind notify socket");
+        let (_tempdir, _tempdir_fd, socket_path, socket) = bind_short_notify_socket();
         let notifier = Notifier {
-            socket: Some(socket_path.into_os_string()),
+            socket: Some(socket_path),
             watchdog_interval: None,
         };
         let state = Arc::new(RuntimeState::new(
@@ -317,11 +334,9 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn status_changes_do_not_postpone_watchdog_pings() {
-        let tempdir = tempfile::tempdir().expect("temporary notify socket directory");
-        let socket_path = tempdir.path().join("notify.sock");
-        let socket = tokio::net::UnixDatagram::bind(&socket_path).expect("bind notify socket");
+        let (_tempdir, _tempdir_fd, socket_path, socket) = bind_short_notify_socket();
         let notifier = Notifier {
-            socket: Some(socket_path.into_os_string()),
+            socket: Some(socket_path),
             watchdog_interval: Some(Duration::from_secs(10)),
         };
         let state = Arc::new(RuntimeState::new(
