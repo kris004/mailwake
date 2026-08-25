@@ -236,22 +236,35 @@ mod tests {
     use super::*;
     use crate::state::{RuntimeState, WatcherPhase};
 
-    fn bind_short_notify_socket() -> (
+    fn bind_short_notify_socket() -> Option<(
         tempfile::TempDir,
-        std::fs::File,
+        Option<std::fs::File>,
         OsString,
         tokio::net::UnixDatagram,
-    ) {
-        // Keep the socket node inside the inherited temporary directory while
-        // using a short proc-fd alias that cannot overflow sockaddr_un::sun_path.
+    )> {
+        // Keep the socket node inside the inherited temporary directory. Use a
+        // short proc-fd alias when available, otherwise retain the portable
+        // pathname test when the inherited path fits sockaddr_un::sun_path.
         let tempdir = tempfile::tempdir().expect("temporary notify socket directory");
-        let tempdir_fd =
-            std::fs::File::open(tempdir.path()).expect("open temporary notify socket directory");
-        let socket_path = std::path::Path::new("/proc/self/fd")
-            .join(tempdir_fd.as_raw_fd().to_string())
-            .join("notify.sock");
+        let proc_fd = std::path::Path::new("/proc/self/fd");
+        let tempdir_fd = proc_fd
+            .is_dir()
+            .then(|| std::fs::File::open(tempdir.path()).ok())
+            .flatten();
+        let socket_path = tempdir_fd.as_ref().map_or_else(
+            || tempdir.path().join("notify.sock"),
+            |tempdir_fd| {
+                proc_fd
+                    .join(tempdir_fd.as_raw_fd().to_string())
+                    .join("notify.sock")
+            },
+        );
+        let addr: libc::sockaddr_un = unsafe { mem::zeroed() };
+        if socket_path.as_os_str().as_bytes().len() >= addr.sun_path.len() {
+            return None;
+        }
         let socket = tokio::net::UnixDatagram::bind(&socket_path).expect("bind notify socket");
-        (tempdir, tempdir_fd, socket_path.into_os_string(), socket)
+        Some((tempdir, tempdir_fd, socket_path.into_os_string(), socket))
     }
 
     #[test]
@@ -288,7 +301,9 @@ mod tests {
 
     #[tokio::test]
     async fn status_task_sends_command_activity_changes_immediately() {
-        let (_tempdir, _tempdir_fd, socket_path, socket) = bind_short_notify_socket();
+        let Some((_tempdir, _tempdir_fd, socket_path, socket)) = bind_short_notify_socket() else {
+            return;
+        };
         let notifier = Notifier {
             socket: Some(socket_path),
             watchdog_interval: None,
@@ -334,7 +349,9 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn status_changes_do_not_postpone_watchdog_pings() {
-        let (_tempdir, _tempdir_fd, socket_path, socket) = bind_short_notify_socket();
+        let Some((_tempdir, _tempdir_fd, socket_path, socket)) = bind_short_notify_socket() else {
+            return;
+        };
         let notifier = Notifier {
             socket: Some(socket_path),
             watchdog_interval: Some(Duration::from_secs(10)),
