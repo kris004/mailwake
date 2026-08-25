@@ -5,21 +5,12 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
-    inputs:
-      tag:
-        description: Existing release tag to rebuild
-        required: true
-        type: string
 
-permissions:
-  contents: read
+permissions: {}
 
 concurrency:
-  group: ${{ github.workflow }}-${{ inputs.tag || github.ref_name }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
-
-env:
-  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   build-linux-x86_64:
@@ -30,63 +21,26 @@ jobs:
       contents: read
     outputs:
       asset_base: ${{ steps.release.outputs.asset_base }}
+      release_artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      release_commit: ${{ steps.release.outputs.release_commit }}
+      release_tag: ${{ steps.release.outputs.release_tag }}
       tag_object: ${{ steps.release.outputs.tag_object }}
       version: ${{ steps.release.outputs.version }}
     steps:
-      - name: Validate requested tag
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
-            echo "unsupported release tag: $RELEASE_TAG" >&2
-            exit 1
-          fi
-
-          version=${RELEASE_TAG#v}
-          if [[ "$version" == *-* ]]; then
-            prerelease=${version#*-}
-            IFS='.' read -r -a identifiers <<< "$prerelease"
-            for identifier in "${identifiers[@]}"; do
-              if [[ "$identifier" =~ ^[0-9]+$ && "$identifier" == 0* && "$identifier" != "0" ]]; then
-                echo "numeric prerelease identifiers cannot have leading zeroes: $identifier" >&2
-                exit 1
-              fi
-            done
-          fi
-
-      - name: Check out release tag
+      - name: Check out release source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           clean: true
           fetch-depth: 0
           persist-credentials: false
-          ref: refs/tags/${{ env.RELEASE_TAG }}
+          ref: ${{ github.ref }}
 
-      - name: Validate tag and package version
+      - name: Validate release metadata
         id: release
         shell: bash
         run: |
           set -euo pipefail
 
-          git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"
-          tag_object=$(git rev-parse "refs/tags/$RELEASE_TAG")
-          tag_commit=$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")
-          head_commit=$(git rev-parse HEAD)
-          if [[ "$tag_commit" != "$head_commit" ]]; then
-            echo "checkout $head_commit does not match $RELEASE_TAG ($tag_commit)" >&2
-            exit 1
-          fi
-
-          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
-            event_commit=$(git rev-parse "$GITHUB_SHA^{commit}")
-            if [[ "$event_commit" != "$head_commit" ]]; then
-              echo "push event $event_commit does not match checkout $head_commit" >&2
-              exit 1
-            fi
-          fi
-
-          version=${RELEASE_TAG#v}
           package_version=$(python3 - <<'PY'
           import tomllib
 
@@ -94,17 +48,166 @@ jobs:
               print(tomllib.load(manifest)["package"]["version"])
           PY
           )
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            release_tag=$GITHUB_REF_NAME
+          else
+            release_tag="v${package_version}"
+          fi
+
+          if [[ ! "$release_tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(alpha|beta|rc)([.-]?(0|[1-9][0-9]*))?)?$ ]]; then
+            echo "unsupported release tag: $release_tag" >&2
+            exit 1
+          fi
+
+          version=${release_tag#v}
           if [[ "$version" != "$package_version" ]]; then
             echo "tag version $version does not match Cargo.toml $package_version" >&2
             exit 1
           fi
 
+          release_commit=$(git rev-parse HEAD)
+          tag_object=
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            git show-ref --verify --quiet "refs/tags/$release_tag"
+            if [[ $(git cat-file -t "refs/tags/$release_tag") != "tag" ]]; then
+              echo "release tag must be an annotated tag object" >&2
+              exit 1
+            fi
+
+            tag_object=$(git rev-parse "refs/tags/$release_tag")
+            tag_commit=$(git rev-parse "refs/tags/$release_tag^{commit}")
+            if [[ "$tag_commit" != "$release_commit" ]]; then
+              echo "checkout $release_commit does not match $release_tag ($tag_commit)" >&2
+              exit 1
+            fi
+
+            event_commit=$(git rev-parse "$GITHUB_SHA^{commit}")
+            if [[ "$event_commit" != "$release_commit" ]]; then
+              echo "push event $event_commit does not match checkout $release_commit" >&2
+              exit 1
+            fi
+          fi
+
           asset_base="mailwake-${version}-x86_64-unknown-linux-gnu-ubuntu-24.04"
           {
             echo "asset_base=$asset_base"
+            echo "release_commit=$release_commit"
+            echo "release_tag=$release_tag"
             echo "tag_object=$tag_object"
             echo "version=$version"
           } >> "$GITHUB_OUTPUT"
+          echo "RELEASE_TAG=$release_tag" >> "$GITHUB_ENV"
+
+      - name: Verify signed tag, default-branch ancestry, and required checks
+        if: github.event_name == 'push'
+        env:
+          EXPECTED_COMMIT: ${{ steps.release.outputs.release_commit }}
+          EXPECTED_TAG_OBJECT: ${{ steps.release.outputs.tag_object }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          github_api() {
+            curl --proto '=https' --tlsv1.2 --fail-with-body --silent --show-error \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/$1"
+          }
+
+          release_probe="${RUNNER_TEMP}/mailwake-release.json"
+          release_status=$(curl \
+            --proto '=https' \
+            --tlsv1.2 \
+            --silent \
+            --show-error \
+            --output "$release_probe" \
+            --write-out '%{http_code}' \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}")
+          case "$release_status" in
+            200)
+              echo "a release already exists for $RELEASE_TAG; refusing to rebuild it" >&2
+              exit 1
+              ;;
+            404)
+              ;;
+            *)
+              echo "could not determine whether a release already exists (HTTP $release_status)" >&2
+              cat "$release_probe" >&2
+              exit 1
+              ;;
+          esac
+
+          ref_json=$(github_api \
+            "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}")
+          remote_type=$(jq -r '.object.type' <<< "$ref_json")
+          remote_tag_object=$(jq -r '.object.sha' <<< "$ref_json")
+          if [[ "$remote_type" != "tag" ||
+                "$remote_tag_object" != "$EXPECTED_TAG_OBJECT" ]]; then
+            echo "GitHub tag ref does not match the local annotated tag object" >&2
+            exit 1
+          fi
+
+          tag_json=$(github_api \
+            "repos/${GITHUB_REPOSITORY}/git/tags/${remote_tag_object}")
+          remote_name=$(jq -r '.tag' <<< "$tag_json")
+          remote_target_type=$(jq -r '.object.type' <<< "$tag_json")
+          remote_target=$(jq -r '.object.sha' <<< "$tag_json")
+          verified=$(jq -r '.verification.verified' <<< "$tag_json")
+          verification_reason=$(jq -r '.verification.reason' <<< "$tag_json")
+          if [[ "$remote_name" != "$RELEASE_TAG" ||
+                "$remote_target_type" != "commit" ||
+                "$remote_target" != "$EXPECTED_COMMIT" ]]; then
+            echo "release tag must point directly at the checked-out commit" >&2
+            exit 1
+          fi
+          if [[ "$verified" != "true" || "$verification_reason" != "valid" ]]; then
+            echo "GitHub did not verify the release tag: $verification_reason" >&2
+            exit 1
+          fi
+
+          repository_json=$(github_api "repos/${GITHUB_REPOSITORY}")
+          default_branch=$(jq -r '.default_branch' <<< "$repository_json")
+          encoded_branch=$(jq -rn --arg value "$default_branch" '$value | @uri')
+          comparison=$(github_api \
+            "repos/${GITHUB_REPOSITORY}/compare/${EXPECTED_COMMIT}...${encoded_branch}")
+          merge_base=$(jq -r '.merge_base_commit.sha' <<< "$comparison")
+          if [[ "$merge_base" != "$EXPECTED_COMMIT" ]]; then
+            echo "$EXPECTED_COMMIT is not reachable from $default_branch" >&2
+            exit 1
+          fi
+
+          checks=$(github_api \
+            "repos/${GITHUB_REPOSITORY}/commits/${EXPECTED_COMMIT}/check-runs?per_page=100")
+          required_checks=(
+            "Format, lint, and test"
+            "Rust 1.95 compatibility"
+          )
+          for required_check in "${required_checks[@]}"; do
+            latest=$(jq -c --arg name "$required_check" '
+              [
+                .check_runs[]
+                | select(.name == $name)
+              ]
+              | sort_by(.started_at)
+              | last // empty
+            ' <<< "$checks")
+            if [[ -z "$latest" ]]; then
+              echo "required check is missing: $required_check" >&2
+              exit 1
+            fi
+
+            status=$(jq -r '.status' <<< "$latest")
+            conclusion=$(jq -r '.conclusion' <<< "$latest")
+            if [[ "$status" != "completed" || "$conclusion" != "success" ]]; then
+              echo "required check is not green: $required_check ($status/$conclusion)" >&2
+              exit 1
+            fi
+          done
 
       - name: Install Rust 1.95
         run: rustup toolchain install 1.95.0 --profile minimal
@@ -161,7 +264,7 @@ jobs:
           set -euo pipefail
 
           archive="${ASSET_BASE}.tar.gz"
-          checksum="${archive}.sha256"
+          checksum="SHA256SUMS"
           package_root="dist/${ASSET_BASE}"
           source_date_epoch=$(git show -s --format=%ct HEAD)
 
@@ -170,6 +273,7 @@ jobs:
           install -m 0755 target/release/mailwake "$package_root/mailwake"
           install -m 0644 \
             README.md \
+            RELEASING.md \
             SECURITY.md \
             CONTRIBUTING.md \
             LICENSE-APACHE \
@@ -260,6 +364,7 @@ jobs:
             LICENSE-APACHE \
             LICENSE-MIT \
             README.md \
+            RELEASING.md \
             RUST-STANDARD-LIBRARY-COPYRIGHT.html \
             SECURITY.md \
             THIRD_PARTY_LICENSES.html; do
@@ -272,28 +377,74 @@ jobs:
           tar -tzf "dist/$archive"
 
       - name: Preserve release assets for publication
+        id: upload
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: release-assets-${{ env.RELEASE_TAG }}
+          name: release-assets-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             dist/${{ steps.release.outputs.asset_base }}.tar.gz
-            dist/${{ steps.release.outputs.asset_base }}.tar.gz.sha256
+            dist/SHA256SUMS
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
 
-  publish:
-    name: Attach assets to GitHub release
+  attest:
+    name: Attest release assets
+    if: github.event_name == 'push'
     needs: build-linux-x86_64
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 5
     permissions:
-      contents: write
+      contents: read
+      id-token: write # Mint a short-lived Sigstore signing identity.
+      attestations: write # Store provenance in this repository.
+      artifact-metadata: write # Record metadata for attested artifacts.
     steps:
       - name: Retrieve release assets
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: release-assets-${{ env.RELEASE_TAG }}
+          artifact-ids: ${{ needs.build-linux-x86_64.outputs.release_artifact_id }}
+          path: dist
+
+      - name: Verify release assets
+        env:
+          ASSET_BASE: ${{ needs.build-linux-x86_64.outputs.asset_base }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          archive="${ASSET_BASE}.tar.gz"
+          checksum="SHA256SUMS"
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 2
+          test -f "dist/$archive"
+          test -f "dist/$checksum"
+          (
+            cd dist
+            sha256sum --check "$checksum"
+          )
+
+      - name: Attest build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+
+  draft:
+    name: Create reviewed release draft
+    if: github.event_name == 'push'
+    needs: [build-linux-x86_64, attest]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ needs.build-linux-x86_64.outputs.release_tag }}
+    steps:
+      - name: Retrieve attested release assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.build-linux-x86_64.outputs.release_artifact_id }}
           path: dist
 
       - name: Validate retrieved assets
@@ -305,7 +456,7 @@ jobs:
           set -euo pipefail
 
           archive="${ASSET_BASE}.tar.gz"
-          checksum="${archive}.sha256"
+          checksum="SHA256SUMS"
           test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 2
           test -f "dist/$archive"
           test -f "dist/$checksum"
@@ -334,9 +485,17 @@ jobs:
         run: |
           set -euo pipefail
 
-          remote_tag_object=$(gh api \
-            "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" \
-            --jq '.object.sha')
+          github_api() {
+            curl --proto '=https' --tlsv1.2 --fail-with-body --silent --show-error \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/$1"
+          }
+
+          ref_json=$(github_api \
+            "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}")
+          remote_tag_object=$(jq -r '.object.sha' <<< "$ref_json")
           if [[ "$remote_tag_object" != "$EXPECTED_TAG_OBJECT" ]]; then
             echo "remote tag moved after build: expected $EXPECTED_TAG_OBJECT, got $remote_tag_object" >&2
             exit 1
@@ -344,35 +503,39 @@ jobs:
 
           if ! gh release view "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            if [[ "$GITHUB_EVENT_NAME" != "push" ]]; then
-              echo "manual rebuild requires an existing release for $RELEASE_TAG" >&2
-              exit 1
-            fi
-
             notes_file="${RUNNER_TEMP}/mailwake-release-notes.md"
             printf '%s\n' \
-              "Automated draft for mailwake ${VERSION}." \
+              "Attested release assets for mailwake ${VERSION}." \
               "" \
-              "Review the release notes and uploaded artifacts before publishing." \
+              "Review the generated notes and assets before publishing this immutable release." \
               > "$notes_file"
 
-            release_args=(
-              "$RELEASE_TAG"
-              --repo "$GITHUB_REPOSITORY"
-              --verify-tag
-              --draft
-              --latest=false
-              --title "mailwake ${VERSION}"
-              --notes-file "$notes_file"
-            )
+            release_args=()
             if [[ "$VERSION" == *-* ]]; then
-              release_args+=(--prerelease)
+              release_args+=(--prerelease --latest=false)
+            else
+              release_args+=(--latest)
             fi
 
-            if ! gh release create "${release_args[@]}"; then
+            if ! gh release create "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --draft \
+              --generate-notes \
+              --title "mailwake ${VERSION}" \
+              --notes-file "$notes_file" \
+              "${release_args[@]}"; then
               gh release view "$RELEASE_TAG" \
                 --repo "$GITHUB_REPOSITORY" >/dev/null
             fi
+          fi
+
+          if [[ $(gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json isDraft \
+            --jq '.isDraft') != "true" ]]; then
+            echo "release is already published; refusing to mutate it" >&2
+            exit 1
           fi
 
           release_id=$(gh release view "$RELEASE_TAG" \
@@ -385,8 +548,19 @@ jobs:
           fi
 
           release_json() {
-            gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}"
+            github_api "repos/${GITHUB_REPOSITORY}/releases/${release_id}"
           }
+
+          json=$(release_json)
+          unexpected_assets=$(jq \
+            --arg archive "$ARCHIVE" \
+            --arg checksum "$CHECKSUM" \
+            '[.assets[] | select(.name != $archive and .name != $checksum)] | length' \
+            <<< "$json")
+          if [[ "$unexpected_assets" -ne 0 ]]; then
+            echo "release draft contains unexpected assets" >&2
+            exit 1
+          fi
 
           ensure_asset() {
             local file=$1
@@ -451,3 +625,9 @@ jobs:
           ensure_asset "dist/$CHECKSUM" "$CHECKSUM_DIGEST"
           verify_asset "$ARCHIVE" "$ARCHIVE_DIGEST"
           verify_asset "$CHECKSUM" "$CHECKSUM_DIGEST"
+
+          json=$(release_json)
+          if [[ $(jq '.assets | length' <<< "$json") -ne 2 ]]; then
+            echo "release draft does not contain exactly the attested assets" >&2
+            exit 1
+          fi

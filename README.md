@@ -69,9 +69,13 @@ install -m 0755 "${archive}/mailwake" ~/.local/bin/mailwake
 ```
 
 The SHA-256 file checks download integrity; it is not a cryptographic signature.
+`v0.1.0-beta.2` is a historical release with an unsigned annotated tag and no
+build-provenance attestation. Future releases require a signed, GitHub-verified
+annotated tag and attach provenance attestations for the exact published assets.
 The archive also contains project, dependency, and Rust standard-library license
 notices, plus the documentation, examples, OAuth helper, and basic and hardened
-systemd units. There are currently no package-manager releases.
+systemd units. The archive is not published through a general package registry;
+a separate Gentoo overlay builds tagged release commits from source.
 
 ## Install from source
 
@@ -209,6 +213,7 @@ Keep the boundary narrow: source event in, configured command out.
 - [Generic example](examples/config.example.toml)
 - [Gmail example](examples/gmail.example.toml)
 - [Contributing](CONTRIBUTING.md)
+- [Release process](RELEASING.md)
 
 ## Development
 
