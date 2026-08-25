@@ -56,22 +56,27 @@ and tested on Ubuntu 24.04 and dynamically links to glibc and OpenSSL 3
 distributions and may not run on older glibc-based distributions. Other
 platforms should install from source.
 
-For `v0.1.0-beta.2`, download both release assets into one directory, then run:
+For `v0.1.0-beta.3`, download both release assets into one directory, then run:
 
 ```sh
-version=0.1.0-beta.2
+version=0.1.0-beta.3
 archive="mailwake-${version}-x86_64-unknown-linux-gnu-ubuntu-24.04"
-sha256sum --check "${archive}.tar.gz.sha256"
+sha256sum --check SHA256SUMS
+gh attestation verify "${archive}.tar.gz" --repo kris004/mailwake
+gh attestation verify SHA256SUMS --repo kris004/mailwake
 tar -xzf "${archive}.tar.gz"
 install -d ~/.local/bin
 install -m 0755 "${archive}/mailwake" ~/.local/bin/mailwake
 ~/.local/bin/mailwake --version
 ```
 
-The SHA-256 file checks download integrity; it is not a cryptographic signature.
+The checksum file checks download integrity; the `gh` commands verify GitHub
+build-provenance attestations for both downloaded assets. A checksum is not a
+cryptographic signature.
 `v0.1.0-beta.2` is a historical release with an unsigned annotated tag and no
-build-provenance attestation. Future releases require a signed, GitHub-verified
-annotated tag and attach provenance attestations for the exact published assets.
+build-provenance attestation. Releases beginning with `v0.1.0-beta.3` require a
+signed, GitHub-verified annotated tag and attach provenance attestations for the
+exact published assets.
 The archive also contains project, dependency, and Rust standard-library license
 notices, plus the documentation, examples, OAuth helper, and basic and hardened
 systemd units. The archive is not published through a general package registry;
