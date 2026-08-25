@@ -60,10 +60,11 @@ For `v0.1.0-beta.3`, download both release assets into one directory, then run:
 
 ```sh
 version=0.1.0-beta.3
+repository=OWNER/REPOSITORY
 archive="mailwake-${version}-x86_64-unknown-linux-gnu-ubuntu-24.04"
 sha256sum --check SHA256SUMS
-gh attestation verify "${archive}.tar.gz" --repo kris004/mailwake
-gh attestation verify SHA256SUMS --repo kris004/mailwake
+gh attestation verify "${archive}.tar.gz" --repo "$repository"
+gh attestation verify SHA256SUMS --repo "$repository"
 tar -xzf "${archive}.tar.gz"
 install -d ~/.local/bin
 install -m 0755 "${archive}/mailwake" ~/.local/bin/mailwake
