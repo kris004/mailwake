@@ -358,6 +358,10 @@ async fn run_daemon(
     let notifier = Notifier::from_env(systemd_enabled);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (startup_tx, startup_rx) = watch::channel(false);
+    let (resume_tx, resume_rx) = watch::channel(());
+    // One configured logind listener broadcasts to every IMAP watcher. Multiple
+    // system_resume sources must not restart the same sessions repeatedly.
+    let mut resume_tx = Some(resume_tx);
     let (fatal_tx, mut fatal_rx) = mpsc::unbounded_channel::<CodedExitError>();
     let mut initial_receivers: Vec<oneshot::Receiver<Result<(), String>>> = Vec::new();
     let mut task_handles = Vec::new();
@@ -440,6 +444,7 @@ async fn run_daemon(
                     watcher_id,
                     initial_ready,
                     shutdown: shutdown_rx.clone(),
+                    resume_rx: resume_rx.clone(),
                     settings: mailwake::imap::WatcherSettings {
                         idle_refresh: config.idle_refresh(),
                         auth_helper_timeout: config.auth_helper_timeout(),
@@ -518,6 +523,7 @@ async fn run_daemon(
                         watcher_id,
                         initial_ready,
                         shutdown: shutdown_rx.clone(),
+                        resume_rx: resume_rx.clone(),
                         settings: mailwake::imap::WatcherSettings {
                             idle_refresh: config.idle_refresh(),
                             auth_helper_timeout: config.auth_helper_timeout(),
@@ -660,6 +666,7 @@ async fn run_daemon(
                     watcher_id,
                     initial_ready,
                     shutdown: shutdown_rx.clone(),
+                    resume_tx: resume_tx.take(),
                 }));
             }
         }
@@ -977,6 +984,7 @@ struct ImapWatcherTask {
     watcher_id: String,
     initial_ready: Option<oneshot::Sender<Result<(), String>>>,
     shutdown: watch::Receiver<bool>,
+    resume_rx: watch::Receiver<()>,
     settings: mailwake::imap::WatcherSettings,
 }
 
@@ -997,6 +1005,7 @@ fn spawn_watcher(
             watcher_id: task.watcher_id,
             initial_ready: task.initial_ready,
             shutdown: task.shutdown,
+            resume_rx: task.resume_rx,
             settings: task.settings,
         })
         .await

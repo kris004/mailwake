@@ -68,6 +68,7 @@ impl ImapError {
 #[derive(Debug, Eq, PartialEq)]
 enum RunEnd {
     Shutdown,
+    Reconnect,
 }
 
 struct MailboxRunContext<'a> {
@@ -78,6 +79,7 @@ struct MailboxRunContext<'a> {
     watcher_id: &'a str,
     initial_ready: &'a mut Option<oneshot::Sender<Result<(), String>>>,
     established: &'a mut bool,
+    notify_on_connect: bool,
     shutdown: &'a mut watch::Receiver<bool>,
     settings: WatcherSettings,
 }
@@ -90,6 +92,7 @@ pub struct MailboxWatchTask {
     pub watcher_id: String,
     pub initial_ready: Option<oneshot::Sender<Result<(), String>>>,
     pub shutdown: watch::Receiver<bool>,
+    pub resume_rx: watch::Receiver<()>,
     pub settings: WatcherSettings,
 }
 
@@ -102,9 +105,11 @@ pub async fn watch_mailbox_forever(task: MailboxWatchTask) -> Result<(), ImapErr
         watcher_id,
         mut initial_ready,
         mut shutdown,
+        mut resume_rx,
         settings,
     } = task;
     let mut backoff = INITIAL_BACKOFF;
+    let mut connected_once = false;
 
     loop {
         if *shutdown.borrow() {
@@ -122,13 +127,31 @@ pub async fn watch_mailbox_forever(task: MailboxWatchTask) -> Result<(), ImapErr
                 watcher_id: &watcher_id,
                 initial_ready: &mut initial_ready,
                 established: &mut established,
+                notify_on_connect: connected_once,
                 shutdown: &mut shutdown,
                 settings,
             };
-            run_mailbox_once(&mut context).await
+            tokio::select! {
+                result = run_mailbox_once(&mut context) => result,
+                () = wait_for_resume(&mut resume_rx) => {
+                    // Drop the entire old session, including an in-flight
+                    // handshake. DONE can block on a dead pre-sleep socket.
+                    Ok(RunEnd::Reconnect)
+                }
+            }
         };
+        connected_once |= established;
         match run_result {
             Ok(RunEnd::Shutdown) => break,
+            Ok(RunEnd::Reconnect) => {
+                info!(
+                    account = %account.name,
+                    mailbox = %mailbox.name,
+                    "IMAP watcher reconnecting after system resume"
+                );
+                backoff = INITIAL_BACKOFF;
+                continue;
+            }
             Err(error) if error.is_permanent_auth_failure() => {
                 let error_text = error.to_string();
                 state.mark_watcher(&watcher_id, WatcherPhase::Crashed);
@@ -158,8 +181,16 @@ pub async fn watch_mailbox_forever(task: MailboxWatchTask) -> Result<(), ImapErr
             backoff = INITIAL_BACKOFF;
         }
         state.mark_watcher(&watcher_id, WatcherPhase::Reconnecting);
-        if !sleep_or_shutdown(backoff, &mut shutdown).await {
-            break;
+        tokio::select! {
+            retry = sleep_or_shutdown(backoff, &mut shutdown) => {
+                if !retry {
+                    break;
+                }
+            }
+            () = wait_for_resume(&mut resume_rx) => {
+                backoff = INITIAL_BACKOFF;
+                continue;
+            }
         }
         backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
     }
@@ -171,6 +202,14 @@ pub async fn watch_mailbox_forever(task: MailboxWatchTask) -> Result<(), ImapErr
         "IMAP watcher stopped"
     );
     Ok(())
+}
+
+async fn wait_for_resume(resume_rx: &mut watch::Receiver<()>) {
+    if resume_rx.changed().await.is_err() {
+        // No configured resume source (or its listener has stopped). Do not
+        // turn a closed channel into an immediate reconnect loop.
+        std::future::pending::<()>().await;
+    }
 }
 
 async fn run_mailbox_once(context: &mut MailboxRunContext<'_>) -> Result<RunEnd, ImapError> {
@@ -413,6 +452,21 @@ where
             .mark_watcher(context.watcher_id, WatcherPhase::Idling);
         if !*context.established {
             *context.established = true;
+            if context.notify_on_connect {
+                // EXAMINE establishes a fresh baseline; changes missed while
+                // disconnected need not be replayed by IDLE.
+                queue_mailbox_event(
+                    context.events,
+                    context.state,
+                    &context.account.name,
+                    &context.mailbox.name,
+                );
+                info!(
+                    account = %context.account.name,
+                    mailbox = %context.mailbox.name,
+                    "queued IMAP reconnect catch-up event"
+                );
+            }
             if let Some(sender) = context.initial_ready.take() {
                 let _ = sender.send(Ok(()));
             }
@@ -774,6 +828,250 @@ impl fmt::Debug for dyn ImapStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::AuthMethod;
+    use tokio::net::TcpListener;
+    use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+    use tokio::task::JoinHandle;
+
+    struct TestWatcher {
+        events: mpsc::Receiver<()>,
+        ready: oneshot::Receiver<Result<(), String>>,
+        shutdown: watch::Sender<bool>,
+        resume: Option<watch::Sender<()>>,
+        handle: JoinHandle<Result<(), ImapError>>,
+    }
+
+    fn spawn_test_watcher(port: u16) -> TestWatcher {
+        let state = Arc::new(RuntimeState::new(
+            1,
+            1,
+            0,
+            Duration::from_secs(3600),
+            Duration::from_secs(60),
+        ));
+        state.register_watcher("example-inbox");
+        let (events_tx, events) = mpsc::channel(8);
+        let (ready_tx, ready) = oneshot::channel();
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let (resume, resume_rx) = watch::channel(());
+        let handle = tokio::spawn(watch_mailbox_forever(MailboxWatchTask {
+            account: AccountConfig {
+                name: "example-account".to_string(),
+                host: "127.0.0.1".to_string(),
+                port: Some(port),
+                username: "user@example.com".to_string(),
+                auth: AuthMethod::Password,
+                xoauth2_cmd: None,
+                password_cmd: None,
+                password: Some(SecretString::new("example-password")),
+                insecure_plaintext: true,
+                danger_accept_invalid_certs: false,
+                mailboxes: vec![],
+            },
+            mailbox: MailboxConfig {
+                name: "INBOX".to_string(),
+                on_notify: String::new(),
+                debounce_seconds: None,
+            },
+            events: events_tx,
+            state,
+            watcher_id: "example-inbox".to_string(),
+            initial_ready: Some(ready_tx),
+            shutdown: shutdown_rx,
+            resume_rx,
+            settings: WatcherSettings {
+                idle_refresh: Duration::from_secs(1740),
+                auth_helper_timeout: Duration::from_secs(1),
+                auth_helper_max_output_bytes: 1024,
+                connect_timeout: Duration::from_secs(1),
+                operation_timeout: Duration::from_secs(1),
+            },
+        }));
+        TestWatcher {
+            events,
+            ready,
+            shutdown,
+            resume: Some(resume),
+            handle,
+        }
+    }
+
+    impl TestWatcher {
+        async fn wait_ready(&mut self) {
+            timeout(Duration::from_secs(3), &mut self.ready)
+                .await
+                .expect("watcher did not become ready")
+                .unwrap()
+                .unwrap();
+        }
+
+        async fn catch_up(&mut self) {
+            assert_eq!(
+                timeout(Duration::from_secs(3), self.events.recv())
+                    .await
+                    .expect("missing reconnect catch-up event"),
+                Some(())
+            );
+        }
+
+        async fn stop(self) {
+            self.shutdown.send(true).unwrap();
+            timeout(Duration::from_secs(3), self.handle)
+                .await
+                .expect("watcher did not stop")
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    struct MockSession {
+        reader: BufReader<OwnedReadHalf>,
+        writer: OwnedWriteHalf,
+        idle_tag: String,
+    }
+
+    impl MockSession {
+        async fn accept(listener: &TcpListener) -> Self {
+            timeout(Duration::from_secs(3), async {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read, mut writer) = stream.into_split();
+                let mut reader = BufReader::new(read);
+                writer.write_all(b"* OK example server\r\n").await.unwrap();
+                for command in ["LOGIN", "EXAMINE"] {
+                    let line = read_line(&mut reader).await.unwrap();
+                    let (tag, arguments) = line.split_once(' ').unwrap();
+                    assert!(arguments.starts_with(command), "{line}");
+                    if command == "EXAMINE" {
+                        // This snapshot is not an IDLE change notification.
+                        writer.write_all(b"* 7 EXISTS\r\n").await.unwrap();
+                    }
+                    writer
+                        .write_all(format!("{tag} OK completed\r\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
+                let mut session = Self {
+                    reader,
+                    writer,
+                    idle_tag: String::new(),
+                };
+                session.enter_idle().await;
+                session
+            })
+            .await
+            .expect("watcher did not establish a new IMAP session")
+        }
+
+        async fn enter_idle(&mut self) {
+            let line = read_line(&mut self.reader).await.unwrap();
+            let (tag, command) = line.split_once(' ').unwrap();
+            assert_eq!(command, "IDLE");
+            self.idle_tag = tag.to_string();
+            self.writer.write_all(b"+ idling\r\n").await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_replaces_idle_socket_without_waiting_for_refresh_or_done() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut watcher = spawn_test_watcher(listener.local_addr().unwrap().port());
+        let mut old = MockSession::accept(&listener).await;
+        watcher.wait_ready().await;
+        assert!(matches!(
+            watcher.events.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        watcher.resume.as_ref().unwrap().send(()).unwrap();
+        let replacement = MockSession::accept(&listener).await;
+        watcher.catch_up().await;
+        let mut line = String::new();
+        assert_eq!(
+            timeout(Duration::from_secs(1), old.reader.read_line(&mut line))
+                .await
+                .expect("pre-sleep session was not closed")
+                .unwrap(),
+            0,
+            "resume must close the stale socket without sending DONE"
+        );
+        assert!(matches!(
+            watcher.events.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        drop(replacement);
+        watcher.stop().await;
+    }
+
+    #[tokio::test]
+    async fn network_reconnect_catches_up_but_initial_connect_and_idle_refresh_do_not() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut watcher = spawn_test_watcher(listener.local_addr().unwrap().port());
+        let original = MockSession::accept(&listener).await;
+        watcher.wait_ready().await;
+        assert!(matches!(
+            watcher.events.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        drop(original);
+
+        let mut replacement = MockSession::accept(&listener).await;
+        watcher.catch_up().await;
+        replacement
+            .writer
+            .write_all(format!("{} OK IDLE completed\r\n", replacement.idle_tag).as_bytes())
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(1), replacement.enter_idle())
+            .await
+            .unwrap();
+        assert!(
+            timeout(Duration::from_millis(50), watcher.events.recv())
+                .await
+                .is_err(),
+            "re-entering IDLE on the same connection must not trigger another catch-up"
+        );
+        drop(replacement);
+        watcher.stop().await;
+    }
+
+    #[tokio::test]
+    async fn resume_interrupts_initial_handshake_without_inventing_a_startup_event() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut watcher = spawn_test_watcher(listener.local_addr().unwrap().port());
+        let (silent_server, _) = timeout(Duration::from_secs(1), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        watcher.resume.as_ref().unwrap().send(()).unwrap();
+        let replacement = MockSession::accept(&listener).await;
+        watcher.wait_ready().await;
+        assert!(matches!(
+            watcher.events.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        drop(silent_server);
+        drop(replacement);
+        watcher.stop().await;
+    }
+
+    #[tokio::test]
+    async fn closed_resume_channel_does_not_interrupt_an_idle_session() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut watcher = spawn_test_watcher(listener.local_addr().unwrap().port());
+        let mut session = MockSession::accept(&listener).await;
+        watcher.wait_ready().await;
+        drop(watcher.resume.take());
+        session.writer.write_all(b"* 8 EXISTS\r\n").await.unwrap();
+        watcher.catch_up().await;
+        assert!(
+            timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err(),
+            "closing the resume channel must not reconnect or spin"
+        );
+        drop(session);
+        watcher.stop().await;
+    }
 
     #[test]
     fn imap_quoting_escapes_special_chars() {

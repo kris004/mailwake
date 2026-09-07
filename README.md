@@ -44,6 +44,13 @@ rather than assuming one command run per event. For `imap_idle`,
 `gmail_api_poll`, and `fs_state`, use `run_on_startup = true` when a startup
 reconciliation is required.
 
+IMAP watchers also emit a catch-up signal after reconnecting an established
+session, so changes missed during a disconnect can be reconciled. When a
+`system_resume` source is configured, resume immediately discards pre-sleep IMAP
+connections and reconnects them; the source's own command still uses its
+configured settle period. Catch-up signals use the normal debounce and command
+lanes. Initial connections still follow `run_on_startup`.
+
 Configuration is loaded only at process start. Restart the daemon after changing
 the file.
 

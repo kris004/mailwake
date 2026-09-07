@@ -254,6 +254,7 @@ pub struct SystemResumeWatcherTask {
     pub watcher_id: String,
     pub initial_ready: Option<oneshot::Sender<Result<(), String>>>,
     pub shutdown: watch::Receiver<bool>,
+    pub resume_tx: Option<watch::Sender<()>>,
 }
 
 pub async fn watch_system_resume_forever(task: SystemResumeWatcherTask) {
@@ -312,6 +313,9 @@ where
                     }
                     Ok(Some(ResumeSignal::Resumed)) => {
                         task.state.mark_event();
+                        if let Some(resume_tx) = &task.resume_tx {
+                            resume_tx.send_replace(());
+                        }
                         match task.events_tx.try_send(()) {
                             Ok(()) => {
                                 info!(source = %task.source.name, "queued system_resume event");
@@ -628,6 +632,8 @@ mod tests {
         state.register_watcher("system-resume");
         let (events_tx, mut events_rx) = mpsc::channel(16);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (resume_tx, mut resume_rx) = watch::channel(());
+        let mut second_resume_rx = resume_rx.clone();
         let task = SystemResumeWatcherTask {
             source: config,
             events_tx,
@@ -635,6 +641,7 @@ mod tests {
             watcher_id: "system-resume".to_string(),
             initial_ready: None,
             shutdown: shutdown_rx,
+            resume_tx: Some(resume_tx),
         };
         let handle = tokio::spawn(watch_system_resume_with_listener(
             task,
@@ -647,8 +654,64 @@ mod tests {
                 .expect("timed out waiting for resume event"),
             Some(())
         );
+        // Every IMAP watcher is notified, not just one channel consumer.
+        assert!(resume_rx.has_changed().unwrap());
+        assert!(second_resume_rx.has_changed().unwrap());
+        resume_rx.borrow_and_update();
+        second_resume_rx.borrow_and_update();
+        assert!(matches!(
+            events_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
 
         let _ = shutdown_tx.send(true);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn suspending_does_not_broadcast_a_resume() {
+        let state = Arc::new(RuntimeState::new(
+            0,
+            1,
+            0,
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        ));
+        state.register_watcher("system-resume");
+        let (events_tx, mut events_rx) = mpsc::channel(1);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (resume_tx, resume_rx) = watch::channel(());
+        let listener = FakeResumeSource::with_events([ResumeSignal::Suspending]);
+        let pending_events = Arc::clone(&listener.events);
+        let handle = tokio::spawn(watch_system_resume_with_listener(
+            SystemResumeWatcherTask {
+                source: SystemResumeSourceConfig {
+                    name: "system-resume".to_string(),
+                    on_resume: "reconcile".to_string(),
+                    settle_seconds: None,
+                },
+                events_tx,
+                state,
+                watcher_id: "system-resume".to_string(),
+                initial_ready: None,
+                shutdown: shutdown_rx,
+                resume_tx: Some(resume_tx),
+            },
+            listener,
+        ));
+        timeout(Duration::from_secs(1), async {
+            while !pending_events.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!resume_rx.has_changed().unwrap());
+        assert!(matches!(
+            events_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        shutdown_tx.send(true).unwrap();
         handle.await.unwrap();
     }
 
@@ -677,6 +740,7 @@ mod tests {
             watcher_id: "system-resume".to_string(),
             initial_ready: Some(ready_tx),
             shutdown: shutdown_rx,
+            resume_tx: None,
         };
         let handle = tokio::spawn(watch_system_resume_with_listener(
             task,
