@@ -15,7 +15,7 @@ use mailwake::lane::{
     CommandLaneRunner, CommandRequest, CommandTrigger, CommandTriggerTarget, LaneCommand,
 };
 use mailwake::state::{CommandRunnerPhase, RuntimeState, WatcherPhase};
-use mailwake::system_resume::{SystemResumeRunner, SystemResumeWatcherTask};
+use mailwake::system_resume::{ResumeBroadcaster, SystemResumeRunner, SystemResumeWatcherTask};
 use mailwake::systemd::{self, Notifier};
 use std::collections::HashMap;
 use std::env;
@@ -359,9 +359,9 @@ async fn run_daemon(
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (startup_tx, startup_rx) = watch::channel(false);
     let (resume_tx, resume_rx) = watch::channel(());
-    // One configured logind listener broadcasts to every IMAP watcher. Multiple
-    // system_resume sources must not restart the same sessions repeatedly.
-    let mut resume_tx = Some(resume_tx);
+    // Every healthy listener can notify IMAP watchers; shared deduplication
+    // prevents multiple sources from restarting the same sessions repeatedly.
+    let resume_broadcaster = ResumeBroadcaster::new(resume_tx);
     let (fatal_tx, mut fatal_rx) = mpsc::unbounded_channel::<CodedExitError>();
     let mut initial_receivers: Vec<oneshot::Receiver<Result<(), String>>> = Vec::new();
     let mut task_handles = Vec::new();
@@ -666,7 +666,7 @@ async fn run_daemon(
                     watcher_id,
                     initial_ready,
                     shutdown: shutdown_rx.clone(),
-                    resume_tx: resume_tx.take(),
+                    resume_broadcaster: Some(resume_broadcaster.clone()),
                 }));
             }
         }

@@ -2,9 +2,10 @@ use crate::config::SystemResumeSourceConfig;
 use crate::lane::{CommandRunReport, CommandTriggerTarget, await_trigger_finished};
 use crate::state::{RuntimeState, WatcherPhase};
 use futures_util::{Stream, StreamExt};
+use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -14,11 +15,57 @@ use tracing::{debug, error, info, warn};
 use zbus::{Connection, Proxy};
 
 const DBUS_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
+const RECENT_RESUME_EVENTS: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResumeSignal {
     Suspending,
     Resumed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResumeEventId {
+    pub sender: Option<String>,
+    pub serial: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct ResumeEvent {
+    pub signal: ResumeSignal,
+    pub id: ResumeEventId,
+}
+
+#[derive(Clone)]
+pub struct ResumeBroadcaster {
+    sender: watch::Sender<()>,
+    recent: Arc<Mutex<VecDeque<ResumeEventId>>>,
+}
+
+impl ResumeBroadcaster {
+    pub fn new(sender: watch::Sender<()>) -> Self {
+        Self {
+            sender,
+            recent: Arc::new(Mutex::new(VecDeque::new())),
+        }
+    }
+
+    fn broadcast(&self, event: &ResumeEvent) {
+        if event.signal != ResumeSignal::Resumed {
+            return;
+        }
+        // All logind listeners see the same sender/serial for a signal.
+        // Retain a bounded history so a lagging listener cannot immediately
+        // replay an earlier resume after another listener saw a newer one.
+        let mut recent = self.recent.lock().expect("resume history mutex poisoned");
+        if recent.contains(&event.id) {
+            return;
+        }
+        if recent.len() == RECENT_RESUME_EVENTS {
+            recent.pop_front();
+        }
+        recent.push_back(event.id.clone());
+        self.sender.send_replace(());
+    }
 }
 
 #[derive(Debug, Error)]
@@ -34,7 +81,7 @@ pub enum SystemResumeError {
 }
 
 pub type ResumeEventFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<Option<ResumeSignal>, SystemResumeError>> + Send + 'a>>;
+    Pin<Box<dyn Future<Output = Result<Option<ResumeEvent>, SystemResumeError>> + Send + 'a>>;
 
 pub trait ResumeEventSource: Send {
     fn next_event(&mut self) -> ResumeEventFuture<'_>;
@@ -77,10 +124,16 @@ impl ResumeEventSource for DbusResumeEventSource {
                 .body()
                 .deserialize::<bool>()
                 .map_err(SystemResumeError::SignalBody)?;
-            Ok(Some(if sleeping {
-                ResumeSignal::Suspending
-            } else {
-                ResumeSignal::Resumed
+            Ok(Some(ResumeEvent {
+                signal: if sleeping {
+                    ResumeSignal::Suspending
+                } else {
+                    ResumeSignal::Resumed
+                },
+                id: ResumeEventId {
+                    sender: message.header().sender().map(ToString::to_string),
+                    serial: message.primary_header().serial_num().get(),
+                },
             }))
         })
     }
@@ -254,7 +307,7 @@ pub struct SystemResumeWatcherTask {
     pub watcher_id: String,
     pub initial_ready: Option<oneshot::Sender<Result<(), String>>>,
     pub shutdown: watch::Receiver<bool>,
-    pub resume_tx: Option<watch::Sender<()>>,
+    pub resume_broadcaster: Option<ResumeBroadcaster>,
 }
 
 pub async fn watch_system_resume_forever(task: SystemResumeWatcherTask) {
@@ -308,13 +361,13 @@ where
             event = listener.next_event() => {
                 task.state.mark_watcher_progress(&task.watcher_id);
                 match event {
-                    Ok(Some(ResumeSignal::Suspending)) => {
+                    Ok(Some(ResumeEvent { signal: ResumeSignal::Suspending, .. })) => {
                         debug!(source = %task.source.name, "system is preparing for sleep");
                     }
-                    Ok(Some(ResumeSignal::Resumed)) => {
+                    Ok(Some(event @ ResumeEvent { signal: ResumeSignal::Resumed, .. })) => {
                         task.state.mark_event();
-                        if let Some(resume_tx) = &task.resume_tx {
-                            resume_tx.send_replace(());
+                        if let Some(broadcaster) = &task.resume_broadcaster {
+                            broadcaster.broadcast(&event);
                         }
                         match task.events_tx.try_send(()) {
                             Ok(()) => {
@@ -383,8 +436,6 @@ mod tests {
     use crate::lane::{
         CommandLaneRunner, CommandLifecycle, CommandRequest, CommandTrigger, LaneCommand,
     };
-    use std::collections::VecDeque;
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::time::timeout;
 
@@ -580,7 +631,7 @@ mod tests {
         lane_handle.await.unwrap();
     }
 
-    type FakeResumeEvents = VecDeque<Result<Option<ResumeSignal>, SystemResumeError>>;
+    type FakeResumeEvents = VecDeque<Result<Option<ResumeEvent>, SystemResumeError>>;
 
     struct FakeResumeSource {
         events: Arc<Mutex<FakeResumeEvents>>,
@@ -596,7 +647,19 @@ mod tests {
         fn with_events(events: impl IntoIterator<Item = ResumeSignal>) -> Self {
             Self {
                 events: Arc::new(Mutex::new(
-                    events.into_iter().map(|event| Ok(Some(event))).collect(),
+                    events
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, signal)| {
+                            Ok(Some(ResumeEvent {
+                                signal,
+                                id: ResumeEventId {
+                                    sender: Some(":1.42".to_string()),
+                                    serial: u32::try_from(index + 1).unwrap(),
+                                },
+                            }))
+                        })
+                        .collect(),
                 )),
             }
         }
@@ -613,6 +676,190 @@ mod tests {
                 }
             })
         }
+    }
+
+    fn test_resume_task(
+        name: &str,
+        broadcaster: ResumeBroadcaster,
+    ) -> (
+        SystemResumeWatcherTask,
+        mpsc::Receiver<()>,
+        watch::Sender<bool>,
+    ) {
+        let state = Arc::new(RuntimeState::new(
+            0,
+            1,
+            0,
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        ));
+        state.register_watcher(name);
+        let (events_tx, events_rx) = mpsc::channel(1);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        (
+            SystemResumeWatcherTask {
+                source: SystemResumeSourceConfig {
+                    name: name.to_string(),
+                    on_resume: "reconcile".to_string(),
+                    settle_seconds: None,
+                },
+                events_tx,
+                state,
+                watcher_id: name.to_string(),
+                initial_ready: None,
+                shutdown: shutdown_rx,
+                resume_broadcaster: Some(broadcaster),
+            },
+            events_rx,
+            shutdown_tx,
+        )
+    }
+
+    async fn deliver_one_resume(
+        task: SystemResumeWatcherTask,
+        mut commands: mpsc::Receiver<()>,
+        shutdown: watch::Sender<bool>,
+    ) {
+        let handle = tokio::spawn(watch_system_resume_with_listener(
+            task,
+            FakeResumeSource::with_events([ResumeSignal::Resumed]),
+        ));
+        assert_eq!(
+            timeout(Duration::from_secs(1), commands.recv())
+                .await
+                .expect("healthy listener did not trigger its command"),
+            Some(())
+        );
+        shutdown.send(true).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn another_listener_broadcasts_after_first_listener_setup_failure() {
+        let (sender, mut receiver) = watch::channel(());
+        let broadcaster = ResumeBroadcaster::new(sender);
+        let (first, _commands, _shutdown) = test_resume_task("first", broadcaster.clone());
+        let (second, commands, shutdown) = test_resume_task("second", broadcaster.clone());
+        report_system_resume_setup_error(
+            first,
+            SystemResumeError::SetupTimeout(DBUS_SETUP_TIMEOUT),
+        );
+        drop(broadcaster);
+
+        // Only the second listener now owns a sender. It must still reach IMAP.
+        let notification = receiver.changed();
+        deliver_one_resume(second, commands, shutdown).await;
+        timeout(Duration::from_secs(1), notification)
+            .await
+            .expect("resume broadcast was lost with the first listener")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn another_listener_broadcasts_after_first_listener_stream_ends() {
+        let (sender, mut receiver) = watch::channel(());
+        let broadcaster = ResumeBroadcaster::new(sender);
+        let (first, _commands, _shutdown) = test_resume_task("first", broadcaster.clone());
+        let (second, commands, shutdown) = test_resume_task("second", broadcaster.clone());
+        watch_system_resume_with_listener(
+            first,
+            FakeResumeSource {
+                events: Arc::new(Mutex::new(VecDeque::from([Ok(None)]))),
+            },
+        )
+        .await;
+        drop(broadcaster);
+
+        let notification = receiver.changed();
+        deliver_one_resume(second, commands, shutdown).await;
+        timeout(Duration::from_secs(1), notification)
+            .await
+            .expect("resume broadcast was lost when the first stream ended")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn duplicate_listeners_each_run_their_command_but_broadcast_once() {
+        let (sender, mut receiver) = watch::channel(());
+        let broadcaster = ResumeBroadcaster::new(sender);
+        let (first, commands, shutdown) = test_resume_task("first", broadcaster.clone());
+        deliver_one_resume(first, commands, shutdown).await;
+        assert!(receiver.has_changed().unwrap());
+        receiver.borrow_and_update();
+
+        let (second, commands, shutdown) = test_resume_task("second", broadcaster);
+        // The same logind sender/serial is delivered to the second listener
+        // after IMAP has already consumed the first notification.
+        let keepalive = second.resume_broadcaster.clone();
+        deliver_one_resume(second, commands, shutdown).await;
+        assert!(!receiver.has_changed().unwrap());
+        drop(keepalive);
+    }
+
+    #[test]
+    fn resume_identity_dedup_handles_lagging_listeners_and_new_logind_senders() {
+        let (sender, mut receiver) = watch::channel(());
+        let broadcaster = ResumeBroadcaster::new(sender);
+        let first = ResumeEvent {
+            signal: ResumeSignal::Resumed,
+            id: ResumeEventId {
+                sender: Some(":1.42".to_string()),
+                serial: 10,
+            },
+        };
+        let mut next = first.clone();
+        next.id.serial += 1;
+        for event in [&first, &next] {
+            broadcaster.broadcast(event);
+            assert!(receiver.has_changed().unwrap());
+            receiver.borrow_and_update();
+        }
+        broadcaster.clone().broadcast(&first);
+        assert!(!receiver.has_changed().unwrap());
+
+        // A replacement logind connection can reuse a serial number.
+        next.id.sender = Some(":1.43".to_string());
+        broadcaster.broadcast(&next);
+        assert!(receiver.has_changed().unwrap());
+        receiver.borrow_and_update();
+
+        for serial in 1..=100 {
+            next.id.serial = serial;
+            broadcaster.broadcast(&next);
+        }
+        assert_eq!(
+            broadcaster.recent.lock().unwrap().len(),
+            RECENT_RESUME_EVENTS
+        );
+    }
+
+    #[tokio::test]
+    async fn dbus_listeners_preserve_the_original_signal_identity() {
+        let message = zbus::Message::signal(
+            "/org/freedesktop/login1",
+            "org.freedesktop.login1.Manager",
+            "PrepareForSleep",
+        )
+        .unwrap()
+        .sender(":1.42")
+        .unwrap()
+        .build(&false)
+        .unwrap();
+        let mut first = DbusResumeEventSource {
+            stream: Box::pin(futures_util::stream::iter([message.clone()])),
+        };
+        let mut second = DbusResumeEventSource {
+            stream: Box::pin(futures_util::stream::iter([message.clone()])),
+        };
+        let first_event = first.next_event().await.unwrap().unwrap();
+        let second_event = second.next_event().await.unwrap().unwrap();
+        assert_eq!(first_event.signal, ResumeSignal::Resumed);
+        assert_eq!(first_event.id, second_event.id);
+        assert_eq!(first_event.id.sender.as_deref(), Some(":1.42"));
+        assert_eq!(
+            first_event.id.serial,
+            message.primary_header().serial_num().get()
+        );
     }
 
     #[tokio::test]
@@ -641,7 +888,7 @@ mod tests {
             watcher_id: "system-resume".to_string(),
             initial_ready: None,
             shutdown: shutdown_rx,
-            resume_tx: Some(resume_tx),
+            resume_broadcaster: Some(ResumeBroadcaster::new(resume_tx)),
         };
         let handle = tokio::spawn(watch_system_resume_with_listener(
             task,
@@ -695,7 +942,7 @@ mod tests {
                 watcher_id: "system-resume".to_string(),
                 initial_ready: None,
                 shutdown: shutdown_rx,
-                resume_tx: Some(resume_tx),
+                resume_broadcaster: Some(ResumeBroadcaster::new(resume_tx)),
             },
             listener,
         ));
@@ -740,7 +987,7 @@ mod tests {
             watcher_id: "system-resume".to_string(),
             initial_ready: Some(ready_tx),
             shutdown: shutdown_rx,
-            resume_tx: None,
+            resume_broadcaster: None,
         };
         let handle = tokio::spawn(watch_system_resume_with_listener(
             task,
